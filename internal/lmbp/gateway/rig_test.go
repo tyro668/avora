@@ -207,8 +207,9 @@ func newRigWith(t *testing.T, flow lmbp.Flow, slowN int, delay time.Duration, wr
 	if !strings.Contains(p.LinkURL, "jkt="+p.JKT) {
 		t.Fatalf("link url lacks jkt: %s", p.LinkURL)
 	}
-	if code, dl := r.api(t, "GET", "/lmbp/v1/tenant/devices", nil, nil); code != 200 || len(dl["pending_pairings"].([]any)) != 1 {
-		t.Fatalf("expected 1 pending pairing before approval: %d %v", code, dl)
+	// §12.6: pending pairings are never listed, not even to their tenant.
+	if code, dl := r.api(t, "GET", "/lmbp/v1/tenant/devices", nil, nil); code != 200 || dl["pending_pairings"] != nil || len(dl["devices"].([]any)) != 0 {
+		t.Fatalf("device list before approval: %d %v", code, dl)
 	}
 	if code, _ := r.api(t, "POST", "/lmbp/v1/tenant/devices/approvals", map[string]string{"user_code": p.UserCode, "jkt": "wrong"}, nil); code != 409 {
 		t.Fatalf("approval with wrong jkt: %d", code)
@@ -216,8 +217,8 @@ func newRigWith(t *testing.T, flow lmbp.Flow, slowN int, delay time.Duration, wr
 	if code, m := r.api(t, "POST", "/lmbp/v1/tenant/devices/approvals", map[string]string{"user_code": p.UserCode, "jkt": p.JKT}, nil); code != 200 {
 		t.Fatalf("approve: %d %v", code, m)
 	}
-	if code, dl := r.api(t, "GET", "/lmbp/v1/tenant/devices", nil, nil); code != 200 || len(dl["pending_pairings"].([]any)) != 0 {
-		t.Fatalf("expected 0 pending pairings after approval: %d %v", code, dl)
+	if code, dl := r.api(t, "GET", "/lmbp/v1/tenant/devices", nil, nil); code != 200 || dl["pending_pairings"] != nil || len(dl["devices"].([]any)) != 1 {
+		t.Fatalf("device list after approval: %d %v", code, dl)
 	}
 	id, err := p.Wait(ctx)
 	if err != nil {

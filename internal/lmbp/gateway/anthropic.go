@@ -547,7 +547,7 @@ func mergeToolCalls(calls, deltas []lmbp.ToolCall) []lmbp.ToolCall {
 		if c.Index != nil {
 			idx = *c.Index
 		}
-		if idx < 0 || idx >= maxToolCalls {
+		if idx < 0 || idx > lmbp.MaxToolCallIndex {
 			continue // rejected on ingress; never index with it
 		}
 		for len(calls) <= idx {

@@ -10,6 +10,7 @@ import httpx
 
 from lmbp_server import LMBPServer, MemoryStore, SQLiteStore, TenantConfig
 from simdevice import pair_and_connect
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -17,7 +18,7 @@ BODY = {"model": "m1", "messages": [{"role": "user", "content": "hello"}]}
 
 
 def new(store):
-    return LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None)
+    return LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None)
 
 
 async def idem_chat(base, key):

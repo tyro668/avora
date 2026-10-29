@@ -26,7 +26,7 @@ from .asgi import LMBPASGI, LMBPMiddleware
 from .client import IncompleteStreamError, InProcessClient, LMBPAPIError, LMBPStream
 from .types import ChatRequest, MessagesRequest
 from .e2ee import E2EEReader, E2EESealed, decode_e2ee_delta, seal_e2ee_request
-from .engine import Gateway, norm_code
+from .engine import Gateway
 from .store import MemoryStore, SQLiteStore, Store, StoreConflict, StoreNotFound
 
 __all__ = ["LMBPStream", "IncompleteStreamError", "E2EESealed", "E2EEReader", "seal_e2ee_request", "decode_e2ee_delta", "LMBPServer", "TenantConfig", "PairingInfo", "PendingPairing", "ApproveResult", "DeviceInfo", "PairingError",
@@ -104,16 +104,14 @@ class _Pairing:
     def __init__(self, s: "LMBPServer"):
         self._s = s
 
-    def link(self, tenant: str, issuer: Optional[str] = None) -> str:
-        """§19.4 deep link for the desktop app."""
-        iss = issuer or self._s.engine.cfg["issuer"]
-        if not iss:
-            raise ValueError("pairing.link needs an issuer (configure LMBPServer(issuer=...) or pass one)")
-        return f"lmbp://pair?v={_L.PAIR_LINK_VERSION}&gateway={quote(_L.origin(iss), safe='')}&tenant={quote(tenant, safe='')}"
+    def link(self, tenant: str) -> str:
+        """§19.4 deep link for the desktop app, on the configured issuer."""
+        iss = self._s.engine.cfg["issuer"]
+        return f"lmbp://pair?v={_L.PAIR_LINK_VERSION}&gateway={quote(iss, safe='')}&tenant={quote(tenant, safe='')}"
 
-    def create(self, tenant: str, issuer: Optional[str] = None) -> PairingInfo:
+    def create(self, tenant: str) -> PairingInfo:
         """Pair link plus its QR code as SVG (needs the ``segno`` package)."""
-        link = self.link(tenant, issuer)
+        link = self.link(tenant)
         import io
 
         import segno
@@ -121,9 +119,15 @@ class _Pairing:
         segno.make(link, error="m").save(buf, kind="svg", scale=4, border=2, xmldecl=False)
         return PairingInfo(link=link, qr_svg=buf.getvalue().decode())
 
-    def lookup(self, tenant: str, user_code: str) -> Optional[PendingPairing]:
-        """Pending pairing for the user code shown on the desktop (to confirm the device before approving)."""
-        d = self._s.store.device_auth_by_user_code(tenant, norm_code(user_code))
+    def lookup(self, tenant: str, end_user: str, user_code: str) -> Optional[PendingPairing]:
+        """Pending pairing for the user code end_user typed (shown on their desktop), to show the device
+        before approving. ``device_name`` is untrusted text chosen by the device: render it as plain text.
+        A code that is not pending returns None and counts as a failed attempt of end_user
+        (PairingError RATE_LIMITED after 10 a minute)."""
+        self._s._check_caller(tenant, end_user)
+        d, e = self._s.engine.pair_lookup(tenant, end_user, user_code)
+        if e and e[0] == 429:
+            raise PairingError(e[2], "RATE_LIMITED")
         if d is None:
             return None
         return PendingPairing(d["user_code"], d["name"], _L.thumbprint(d["pub"]), d["status"],
@@ -154,10 +158,12 @@ class _Pairing:
 class LMBPServer:
     """The gateway. Mount ``server.asgi()`` (or ``LMBPMiddleware``) in your ASGI app."""
 
-    def __init__(self, tenants: list[TenantConfig | dict], issuer: str = "", store: Optional[Store] = None,
+    def __init__(self, tenants: list[TenantConfig | dict], issuer: str, store: Optional[Store] = None,
                  signing_seed: Optional[bytes] = None, max_concurrency: int = 16, chat_ui_dir: str = "",
                  log: Optional[Callable[..., None]] = None, retention: float = 0, **tuning: Any):
-        """``retention``: seconds finished tasks and their Idempotency-Key records
+        """``issuer`` (required): the gateway's public origin, e.g. ``https://gw.example.com``;
+        never derived from the Host header (§18.1).
+        ``retention``: seconds finished tasks and their Idempotency-Key records
         are kept (default 7 days; negative disables purging). Spec §14.4 (errata E6)."""
         self.store: Store = store if store is not None else MemoryStore()
         self.engine = Gateway(issuer=issuer, seed=signing_seed, max_conc=max_concurrency, web_dir=chat_ui_dir,
@@ -180,11 +186,14 @@ class LMBPServer:
         """Typed client calling the gateway in-process as end_user of tenant."""
         return InProcessClient(self, tenant, end_user)
 
-    def _decide(self, tenant, end_user, user_code, deny, jkt):
+    def _check_caller(self, tenant, end_user):
         if tenant not in self.engine.tenants:
             raise PairingError("unknown tenant", "BAD_REQUEST")
         if not _L.valid_header(end_user, 128):
             raise PairingError("end_user must be 1-128 printable ASCII characters (it travels as X-End-User)", "BAD_REQUEST")
+
+    def _decide(self, tenant, end_user, user_code, deny, jkt):
+        self._check_caller(tenant, end_user)
         d, e = self.engine.pair_decide(tenant, end_user, user_code, deny, jkt)
         if e:
             raise PairingError(e[2], {429: "RATE_LIMITED", 404: "NOT_FOUND", 403: "FORBIDDEN", 409: "FORBIDDEN"}.get(e[0], "BAD_REQUEST"))

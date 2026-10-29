@@ -117,9 +117,9 @@ fn get(port: u16, path: &str) -> (u16, String) {
 #[test]
 fn chat_page_and_core_endpoints() {
     let web = concat!(env!("CARGO_MANIFEST_DIR"), "/../web").to_string();
-    gateway::init(gateway::Config { web_dir: web, ..Default::default() }, Some([1u8; 32])).unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
+    gateway::init(gateway::Config { web_dir: web, issuer: format!("http://127.0.0.1:{}", port), ..Default::default() }, Some([1u8; 32])).unwrap();
     std::thread::spawn(move || http::serve(l));
     for (path, ct) in [("/", "text/html"), ("/chat", "text/html"), ("/chat/chat.js", "text/javascript"), ("/chat/qrcode.js", "text/javascript")] {
         let (st, r) = get(port, path);
@@ -185,4 +185,41 @@ fn outbox_forget_fails_queued_sends_first() {
     assert!(matches!(o.results.get(&ids[1]), Some(Err(_))) && matches!(o.results.get(&ids[2]), Some(Err(_))));
     let again = o.enqueue("t1", Box::new(|seq| format!("{{\"seq\":{seq}}}")));
     assert!(matches!(o.results.get(&again), Some(Err(_))), "send after forget admitted");
+}
+
+/// Review 2026-10-29 (P2): the issuer is configuration; an empty one is refused.
+#[test]
+fn issuer_is_required() {
+    let e = gateway::init(gateway::Config::default(), Some([2u8; 32])).err().expect("empty issuer accepted");
+    assert!(e.contains("issuer is required"), "{}", e);
+}
+
+/// Review 2026-10-29 (P1-3): device_name is untrusted; text-disguising characters are refused.
+#[test]
+fn device_name_rule() {
+    for bad in ["Office PC\u{202E}gpj.exe", "a\nb", "x\u{200B}y", "\u{85}", &"a".repeat(101)] {
+        assert!(!lmbp::valid_device_name(bad), "{:?} accepted", bad);
+    }
+    assert!(lmbp::valid_device_name("张三的 MacBook 😀"));
+}
+
+/// Review 2026-10-29 (P2): the jti store evicts by expiry from a heap, never by a full scan.
+#[test]
+fn jti_cache_is_bounded_by_expiry() {
+    let mut c = gateway::JtiCache::default();
+    let until = lmbp::now_ms() + 60_000;
+    for i in 0..200_000 {
+        c.use_jti(&format!("j{}", i), until);
+    }
+    let t0 = std::time::Instant::now();
+    for i in 0..1000 {
+        c.use_jti(&format!("k{}", i), until);
+    }
+    let per = t0.elapsed().as_secs_f64() * 1000.0 / 1000.0;
+    assert!(per < 0.2, "use_jti took {:.3} ms per call at 200k entries", per);
+    assert!(!c.use_jti("j1", until), "replay accepted");
+    c.use_jti("short", lmbp::now_ms() - 1);
+    c.use_jti("trigger", until);
+    assert!(!c.has("short"), "expired entry kept");
+    assert_eq!(c.len(), 201_001);
 }

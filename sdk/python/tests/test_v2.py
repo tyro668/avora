@@ -11,6 +11,7 @@ import websockets
 from lmbp_server import LMBPServer, MemoryStore, PairingError, TenantConfig
 from lmbp_server import protocol as L
 from simdevice import connect, finish_pairing, proof, start_pairing
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -18,7 +19,7 @@ H = {"Authorization": "Bearer " + KEY, "X-End-User": "u1"}
 
 
 def server():
-    return LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=MemoryStore(), log=lambda *a: None)
+    return LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=MemoryStore(), log=lambda *a: None)
 
 
 async def paired(lmbp, base):

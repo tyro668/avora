@@ -9,7 +9,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/tyro668/avora/internal/audit"
 	"github.com/tyro668/avora/internal/backend"
@@ -477,11 +476,8 @@ func (x *Connector) DeleteAdapter(id string) error {
 	}
 	x.mu.Unlock()
 	if err == nil {
-		if x.cfg.Audit != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, _ = x.cfg.Audit.DeleteByAdapter(ctx, id)
-			cancel()
-		}
+		// Audit rows stay (spec §20): only retention and an explicit
+		// audit_purge remove them, never a configuration change.
 		go x.refreshHeartbeat()
 	}
 	return err

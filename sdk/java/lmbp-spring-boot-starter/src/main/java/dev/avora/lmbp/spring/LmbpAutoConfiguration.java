@@ -66,7 +66,7 @@ public class LmbpAutoConfiguration {
       profile.remove("api_key_env");
     }
     if (p.getDisplayName() != null && !p.getDisplayName().isEmpty()) profile.put("display_name", p.getDisplayName());
-    if (p.getIssuer() == null || p.getIssuer().isEmpty()) log.warn("lmbp.issuer is empty: dev mode, the request Host decides the issuer (do not use in production)");
+    if (p.getIssuer() == null || p.getIssuer().isEmpty()) throw new IllegalStateException("lmbp.issuer must be set: the gateway's public origin (never derived from the Host header)");
     return LMBPServer.builder().issuer(p.getIssuer()).tenant(p.getTenant(), p.getApiKey(), profile).store(store).signingSeedHex(p.getSigningSeed())
         .maxConcurrency(p.getMaxConcurrency()).keepaliveMillis(p.getKeepaliveMs()).retentionMillis(p.getRetentionSeconds() < 0 ? -1 : p.getRetentionSeconds() * 1000).chatUiDir(p.getChatUiDir()).logger(log::info).build();
   }

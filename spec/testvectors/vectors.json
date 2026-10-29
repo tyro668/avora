@@ -880,6 +880,28 @@
       }
     },
     {
+      "name": "task.delta(tool_calls index 127)",
+      "frame": {
+        "data": {
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{}",
+                "name": "get_weather"
+              },
+              "id": "call_128",
+              "index": 127,
+              "type": "function"
+            }
+          ]
+        },
+        "seq": 1,
+        "task_id": "task_0192f5e0-7c1a-7cc0-9b4a-000000000008",
+        "type": "task.delta",
+        "v": 2
+      }
+    },
+    {
       "name": "task.delta(e2ee)",
       "frame": {
         "data": {
@@ -1046,6 +1068,29 @@
         }
       },
       "must_reject_because": "seq starts at 1"
+    },
+    {
+      "name": "tool_call_index_128",
+      "frame": {
+        "v": 2,
+        "type": "task.delta",
+        "task_id": "t1",
+        "seq": 1,
+        "data": {
+          "tool_calls": [
+            {
+              "index": 128,
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "f",
+                "arguments": "{}"
+              }
+            }
+          ]
+        }
+      },
+      "must_reject_because": "tool_calls[].index is at most 127 (§16.1)"
     },
     {
       "name": "hello_without_proof",

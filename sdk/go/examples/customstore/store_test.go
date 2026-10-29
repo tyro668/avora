@@ -99,7 +99,7 @@ func (s *countingStore) Close() error { return s.in.Close() }
 
 func TestCustomStore(t *testing.T) {
 	st := &countingStore{in: lmbpserver.NewMemoryStore()}
-	srv, err := lmbpserver.New(context.Background(), lmbpserver.Options{Store: st, Logger: log.New(io.Discard, "", 0),
+	srv, err := lmbpserver.New(context.Background(), lmbpserver.Options{Issuer: "http://127.0.0.1", Store: st, Logger: log.New(io.Discard, "", 0),
 		Tenants: []lmbpserver.Tenant{{ID: "acme", APIKey: "tk_ssssssssssssssssssssssssssssssssssssssss"}}})
 	if err != nil {
 		t.Fatal(err)

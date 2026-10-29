@@ -7,14 +7,16 @@ import path from 'node:path';
 import http from 'node:http';
 import { LMBPServer, MemoryStore, SqliteStore } from '../dist/index.js';
 import { pairAndConnect, connect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const T = 'acme';
 async function setup(store) {
-  const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY }], store, log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY }], store, log: () => {} });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   return { lmbp, base, close: async () => { srv.closeAllConnections(); await new Promise((ok) => srv.close(ok)); } };
 }

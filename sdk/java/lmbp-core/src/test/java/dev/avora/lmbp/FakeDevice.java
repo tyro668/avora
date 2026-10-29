@@ -51,7 +51,7 @@ final class FakeDevice implements AutoCloseable {
 
   /** Starts pairing; returns the user code to approve. */
   String authorize() throws Exception {
-    Map<String, Object> a = post("/lmbp/v1/device/authorize", "tenant=" + enc(tenant) + "&device_name=test-pc&public_key=" + Lmbp.b64(key.pub()));
+    Map<String, Object> a = post("/lmbp/v1/device/authorize", "tenant=" + enc(tenant) + "&device_name=" + enc(deviceName) + "&public_key=" + Lmbp.b64(key.pub()));
     dc = (String) a.get("device_code");
     return (String) a.get("user_code");
   }
@@ -127,7 +127,13 @@ final class FakeDevice implements AutoCloseable {
     ws.sendText(Json.stringify(m), true).join();
   }
 
+  /** When set, answers every task.run instead of the mode's script. */
+  volatile java.util.function.Consumer<String> script;
+  /** device_name sent by authorize(). */
+  volatile String deviceName = "test-pc";
+
   void run(String taskId) {
+    if (script != null) { script.accept(taskId); return; }
     if (mode == Mode.SILENT || mode == Mode.CHUNKS) return;
     if (mode == Mode.BAD) {
       send(Json.obj("v", (long) Lmbp.VERSION, "type", "task.delta", "task_id", taskId, "seq", 1L, "data", Json.obj("text", "almost")));

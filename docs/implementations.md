@@ -30,6 +30,6 @@
 ## 常用命令
 
 - Go 参考网关：`avora server -issuer https://<网关公网地址> [-tenant-profiles profiles.json]`。`profiles.json` 配置每个租户在桌面端同意页上显示的身份，格式见 [mock/tenant-profiles.example.json](../mock/tenant-profiles.example.json)。
-- 黑盒一致性测试（128 项，按配置统计；`-list` 输出需求表）：`LMBP_TENANT_KEY=... go run ./cmd/lmbp-conformance -gateway <url> -tenant <id> [-retention <网关保留期>]`。E6（保留期清理）只在给出 `-retention` 时运行，网关需以同样的短保留期启动（例如 `--retention-seconds 2`），否则记为跳过。`scripts/mock-interop.sh` 默认让每个网关（含 `mock/java`、`mock/rust`）以 2 秒保留期启动并运行 E6；设 `LMBP_RETENTION_SECONDS=` 为空可恢复默认保留期。只检查网关在元数据 `profiles` 中声明的配置，未声明配置的检查记为跳过。
+- 黑盒一致性测试（138 项，按配置统计；`-list` 输出需求表）：`LMBP_TENANT_KEY=... go run ./cmd/lmbp-conformance -gateway <url> -tenant <id> [-retention <网关保留期>]`。E6（保留期清理）只在给出 `-retention` 时运行，网关需以同样的短保留期启动（例如 `--retention-seconds 2`），否则记为跳过。`scripts/mock-interop.sh` 默认让每个网关（含 `mock/java`、`mock/rust`）以 2 秒保留期启动并运行 E6；设 `LMBP_RETENTION_SECONDS=` 为空可恢复默认保留期。只检查网关在元数据 `profiles` 中声明的配置，未声明配置的检查记为跳过。
 - Core-only 网关：`avora server -core-only ...` 只协商 `session.token`、`models.update`，声明 `profiles: ["core", "openai"]`；`scripts/mock-interop.sh go-core` 验证它单独通过全部 Core 检查。
 - 契约与测试向量校验：`spec/validate.sh`。

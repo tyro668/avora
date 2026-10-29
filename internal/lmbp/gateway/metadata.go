@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,24 @@ func (g *Gateway) Issuer() string { return g.cfg.Issuer }
 
 // issuer is the configured origin, or (development mode only) the origin the
 // request was addressed to.
+// loopbackOnly guards the development mode without a configured issuer
+// (§18.1): the issuer is then taken from a loopback Host only; any other Host
+// is refused so a forged Host can never become a signed iss/aud.
+func loopbackOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+		host = strings.Trim(host, "[]")
+		if ip := net.ParseIP(host); !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]string{"error": "invalid_request", "error_description": "gateway issuer is not configured; only loopback hosts are served"})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 func (g *Gateway) issuer(r *http.Request) string {
 	if g.cfg.Issuer != "" {
 		return g.cfg.Issuer

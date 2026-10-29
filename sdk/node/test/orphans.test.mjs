@@ -16,7 +16,7 @@ for (const [name, mk] of [['memory', () => new MemoryStore()], ['sqlite', () => 
       store.createTask({ id: 'task_orphan_' + state, tenant: 'acme', owner: 'u1', device: 'd', model: 'm', state, events: [], request: { secret: 'prompt' } });
     }
     store.appendEvent('task_orphan_RUNNING', { seq: 1, type: 'task.delta', data: { text: 'partial' } });
-    const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: 'k'.repeat(40) }], store, log: () => {}, retention: 60_000 });
+    const lmbp = new LMBPServer({ issuer: 'http://127.0.0.1:1', tenants: [{ id: 'acme', apiKey: 'k'.repeat(40) }], store, log: () => {}, retention: 60_000 });
     try {
       for (const state of ['RUNNING', 'QUEUED']) {
         const t = store.getTask('task_orphan_' + state);

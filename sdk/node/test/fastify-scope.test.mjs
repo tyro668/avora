@@ -9,12 +9,14 @@ import assert from 'node:assert/strict';
 import Fastify from 'fastify';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 
 async function hostApp(withPlugin, order) {
   const app = Fastify();
-  const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY }], log: () => {} });
   const routes = () => {
     app.post('/app/generate', {
       schema: { body: { type: 'object', required: ['prompt'], properties: { prompt: { type: 'string' }, n: { type: 'integer' } } } },
@@ -25,7 +27,7 @@ async function hostApp(withPlugin, order) {
   if (withPlugin && order === 'before') await app.register(lmbp.fastifyPlugin);
   routes();
   if (withPlugin && order === 'after') await app.register(lmbp.fastifyPlugin);
-  await app.listen({ port: 0, host: '127.0.0.1' });
+  await app.listen({ port: lmbpPort, host: '127.0.0.1' });
   return { app, lmbp, base: `http://127.0.0.1:${app.server.address().port}` };
 }
 

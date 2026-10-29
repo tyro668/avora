@@ -30,8 +30,8 @@ import type { TenantConfig, PairingInfo, DeviceInfo, ApproveResult, PendingPairi
 export interface LMBPServerOptions {
   /** Tenants (SaaS products) served by this gateway. Usually one. */
   tenants: TenantConfig[];
-  /** Public https origin of the gateway (iss of every token). Empty = dev mode (derived from Host). */
-  issuer?: string;
+  /** Required: public origin of the gateway (iss of every token), e.g. https://gw.example.com. Never derived from Host (§18.1). */
+  issuer: string;
   /** Persistence; defaults to MemoryStore. Use `new SqliteStore('lmbp.db')` to survive restarts. */
   store?: Store;
   /** 32-byte Ed25519 seed. Default: loaded from the store, generated on first start. */
@@ -61,7 +61,8 @@ export class LMBPServer {
 
   constructor(opts: LMBPServerOptions) {
     this.store = opts.store ?? new MemoryStore();
-    this.engine = new Gateway({ issuer: opts.issuer ?? '', store: this.store, seed: opts.signingSeed, maxConc: opts.maxConcurrency ?? 16,
+    if (!opts.issuer) throw new Error('LMBPServerOptions.issuer is required: the gateway\'s public origin (never derived from the Host header)');
+    this.engine = new Gateway({ issuer: opts.issuer, store: this.store, seed: opts.signingSeed, maxConc: opts.maxConcurrency ?? 16,
       retention: opts.retention ?? 0, webDir: opts.chatUIDir ?? '', log: opts.log ?? console.error, ...(opts.tuning ?? {}) });
     for (const t of opts.tenants) this.engine.registerTenant(t.id, t.apiKey, t.profile ?? {});
   }
@@ -158,22 +159,26 @@ export class LMBPServer {
   // ---------------- pairing ----------------
 
   readonly pairing = {
-    /** §19.4 deep link for the desktop app. issuer defaults to the configured one. */
-    link: (tenant: string, issuer?: string): string => {
-      const iss = issuer ?? this.engine.cfg.issuer;
-      if (!iss) throw new Error('pairing.link needs an issuer (configure LMBPServerOptions.issuer or pass one)');
-      return `lmbp://pair?v=${L.PAIR_LINK_VERSION}&gateway=${encodeURIComponent(L.origin(iss))}&tenant=${encodeURIComponent(tenant)}`;
-    },
+    /** §19.4 deep link for the desktop app, on the configured issuer. */
+    link: (tenant: string): string =>
+      `lmbp://pair?v=${L.PAIR_LINK_VERSION}&gateway=${encodeURIComponent(this.engine.cfg.issuer)}&tenant=${encodeURIComponent(tenant)}`,
     /** Pair link plus its QR code as an SVG string and a PNG-free data: URL (GIF). */
-    create: (tenant: string, issuer?: string): PairingInfo => {
-      const link = this.pairing.link(tenant, issuer);
+    create: (tenant: string): PairingInfo => {
+      const link = this.pairing.link(tenant);
       const q = qrcode(0, 'M'); q.addData(link); q.make();
       return { link, qrSVG: q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }), qrDataURL: q.createDataURL(4, 2) };
     },
-    /** Look up a pending pairing by the user code shown on the desktop (to confirm the device name before approving). */
-    lookup: (tenant: string, userCode: string): PendingPairing | null => {
-      const d = this.store.deviceAuthByUserCode(tenant, normCode(userCode));
-      if (!d) return null;
+    /**
+     * Look up a pending pairing by the user code endUser typed (shown on their desktop), to show the
+     * device before approving. deviceName is untrusted text chosen by the device: render it as plain text.
+     * A code that is not pending returns null and counts as a failed attempt of endUser (RATE_LIMITED after 10 a minute).
+     */
+    lookup: (tenant: string, endUser: string, userCode: string): PendingPairing | null => {
+      this.checkPairingCaller(tenant, endUser);
+      const r = this.engine.pairLookup(tenant, endUser, userCode);
+      if (r.error?.status === 429) throw new PairingError(r.error.message, 'RATE_LIMITED');
+      if (r.error) return null;
+      const d = r.d;
       return { userCode: d.userCode, deviceName: d.name, jkt: L.thumbprint(d.pub), status: d.status, expiresAt: new Date(d.expires) };
     },
     /** Approve the user code for endUser; the desktop app finishes pairing on its next poll. */
@@ -191,9 +196,13 @@ export class LMBPServer {
     revokeDevice: (tenant: string, endUser: string, deviceId: string): boolean => this.engine.revokeDevice(tenant, endUser, deviceId),
   };
 
-  private decide(tenant: string, endUser: string, userCode: string, deny: boolean, jkt?: string): ApproveResult {
+  private checkPairingCaller(tenant: string, endUser: string) {
     if (!this.engine.tenants.has(tenant)) throw new PairingError('unknown tenant', 'BAD_REQUEST');
     if (!L.validHeader(endUser, 128)) throw new PairingError('endUser must be 1-128 printable ASCII characters (it travels as X-End-User)', 'BAD_REQUEST');
+  }
+
+  private decide(tenant: string, endUser: string, userCode: string, deny: boolean, jkt?: string): ApproveResult {
+    this.checkPairingCaller(tenant, endUser);
     const r = this.engine.pairDecide(tenant, endUser, userCode, deny, jkt);
     if (r.error) {
       const code = ({ 429: 'RATE_LIMITED', 404: 'NOT_FOUND', 403: 'FORBIDDEN', 409: 'FORBIDDEN' } as Record<number, PairingError['code']>)[r.error.status] || 'BAD_REQUEST';
@@ -213,10 +222,6 @@ export class PairingError extends Error {
   constructor(message: string, readonly code: 'BAD_REQUEST' | 'NOT_FOUND' | 'FORBIDDEN' | 'RATE_LIMITED') { super(message); }
 }
 
-function normCode(s: string): string {
-  const c = String(s || '').trim().replaceAll('-', '').replaceAll(' ', '').toUpperCase();
-  return c.length === 8 ? c.slice(0, 4) + '-' + c.slice(4) : '';
-}
 
 /** Paths the SDK serves (for frameworks that need explicit routes). */
 export const PATHS = ['/healthz', '/.well-known/jwks.json', '/.well-known/lmbp', '/lmbp/v1/device/authorize', '/lmbp/v1/token', '/lmbp/v1/connect',

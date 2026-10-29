@@ -15,7 +15,7 @@ import os
 
 import anthropic
 import openai
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from lmbp_server import LMBPMiddleware, LMBPServer, PairingError, SQLiteStore, TenantConfig
@@ -26,7 +26,9 @@ API_KEY = os.environ["TENANT_API_KEY"]  # >= 32 chars; server-side secret
 PROFILE = (json.load(open(os.environ["TENANT_PROFILE_FILE"]))[TENANT] if os.environ.get("TENANT_PROFILE_FILE")
            else {"display_name": "Acme Chat (FastAPI)", "requested_scopes": ["lmbp.chat", "lmbp.tools", "lmbp.vision"]})
 
-lmbp = LMBPServer([TenantConfig(TENANT, API_KEY, PROFILE)], issuer=os.environ.get("LMBP_ISSUER", ""),
+# The gateway's public origin (iss of every token): configuration, never the request's Host header.
+ISSUER = os.environ.get("LMBP_ISSUER") or f"http://127.0.0.1:{PORT}"
+lmbp = LMBPServer([TenantConfig(TENANT, API_KEY, PROFILE)], issuer=ISSUER,
                  store=SQLiteStore(os.environ["LMBP_DB"]) if os.environ.get("LMBP_DB") else None,
                  # finished tasks + idempotency records: 7 days unless set (negative disables)
                  retention=float(os.environ.get("LMBP_RETENTION_SECONDS") or 0))
@@ -41,8 +43,8 @@ def user(x_demo_user: str | None) -> str:  # your own login decides who the end 
 
 # ---- 1. pairing ----
 @app.get("/app/pair")
-def pair(request: Request):
-    info = lmbp.pairing.create(TENANT, os.environ.get("LMBP_ISSUER") or str(request.base_url).rstrip("/"))
+def pair():
+    info = lmbp.pairing.create(TENANT)
     return {"link": info.link, "qr_svg": info.qr_svg}
 
 

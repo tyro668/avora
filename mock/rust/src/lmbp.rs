@@ -22,6 +22,33 @@ pub fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Largest task.delta tool_calls[].index (spec §16.1).
+pub const MAX_TOOL_CALL_INDEX: i64 = 127;
+/// Encoded task.delta bytes one task may send, cleartext or sealed (spec §10).
+pub const MAX_TASK_OUTPUT_BYTES: usize = 64 << 20;
+/// device_name: at most 100 code points (spec §6.2).
+pub const MAX_DEVICE_NAME_CHARS: usize = 100;
+
+/// The spec §6.2 rule for the untrusted, device-reported name: at most 100 code points and none
+/// of the characters that can disguise text (C0/C1 controls, U+00AD, U+061C, U+180E,
+/// U+200B-U+200F, U+2028-U+202E, U+2060-U+206F, U+FEFF, U+FFF9-U+FFFB).
+pub fn valid_device_name(s: &str) -> bool {
+    char_len(s) <= MAX_DEVICE_NAME_CHARS
+        && !s.chars().any(|c| {
+            let r = c as u32;
+            r <= 0x1F
+                || (0x7F..=0x9F).contains(&r)
+                || r == 0xAD
+                || r == 0x61C
+                || r == 0x180E
+                || (0x200B..=0x200F).contains(&r)
+                || (0x2028..=0x202E).contains(&r)
+                || (0x2060..=0x206F).contains(&r)
+                || r == 0xFEFF
+                || (0xFFF9..=0xFFFB).contains(&r)
+        })
+}
+
 /// 1..max printable ASCII (0x20-0x7E): X-End-User and Idempotency-Key (spec §4.1).
 pub fn valid_header(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && s.bytes().all(|b| (0x20..=0x7E).contains(&b))

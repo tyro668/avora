@@ -2,6 +2,20 @@
 
 ## 未发布
 
+协议加固（2026-10-29 协议审查的 P1 / P2 项，Go 内核与参考网关、Node / Python / Java SDK、Java / Rust / Node / Python 模拟网关、mock SaaS 与 mock/web 同步修改）：
+
+- `tool_calls[].index` 上限 127（Schema 与网关一致）；越界时网关发 task.cancel(protocol_error)，调用方得到 502 INTERNAL。
+- 每个任务的输出上限 64 MiB（明文和 E2EE 密文增量都计入），超出即取消任务。
+- 配对：网关不再列出待配对请求（`pending_pairings` 已移除），只能用设备上显示的配对码批准；`device_name` 拒绝控制字符和 bidi 等可伪装文本的字符，界面上按纯文本显示并标注「设备自报名称」。
+- 设备授权：未注册租户返回 `invalid_client`；每个客户端地址每分钟 60 次，每个租户最多 1000 个未完成配对，超出返回 429 `slow_down`（`Retry-After: 60`）；设备收到 10 次 `slow_down` 后继续轮询，配对码作废（`expired_token`）。
+- 批准配对码是单次、原子的；错误码按「租户 + 最终用户」每分钟计 10 次，`lookup` 也计入，不再让一个用户锁住整个租户。
+- jti 防重放缓存改为按过期时间的最小堆淘汰，不再每次全表扫描。
+- Node / Python / Java SDK 必须显式配置 `issuer`，不再从请求 Host 推导；Go 参考网关未配置 issuer 时只接受回环 Host（其他 Host 返回 421）。
+- 任务进行中吊销设备：调用方得到 502 `OUTCOME_UNKNOWN`（此前是 401）。
+- 连接器在会话内拒绝重放的 task.run（任务 nonce / E2EE rid）。
+- 删除方案时保留其审计记录（§20）。
+- `lmbp-conformance` 新增 L4、P9–P13、M9、V3、X-T5、Z9 检查，共 138 项。
+
 ## 2.1.3
 
 - 模型适配层统一到 `internal/backend/`，新增 Grok Build 和 Antigravity CLI；后端注册表统一提供命令行和桌面端的服务配置，共用 CLI 进程树清理和协议测试。

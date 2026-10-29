@@ -76,7 +76,10 @@ func TestChatUILayoutRequirements(t *testing.T) {
 		t.Fatal(err)
 	}
 	js := string(jb)
-	for _, want := range []string{"pending_pairings", "revoked-group", "revoked-toggle", "openPairModal", "closePairModal", "localStorage", "X-Task-Id", "tool_calls"} {
+	if strings.Contains(js, "pending_pairings") {
+		t.Fatal("chat.js must not read pending_pairings (pending pairings are never listed; review 2026-10-29)")
+	}
+	for _, want := range []string{"设备自报名称", "revoked-group", "revoked-toggle", "openPairModal", "closePairModal", "localStorage", "X-Task-Id", "tool_calls"} {
 		if !strings.Contains(js, want) {
 			t.Fatalf("chat.js missing %s", want)
 		}
@@ -104,7 +107,7 @@ func TestChatJSUnit(t *testing.T) {
 	if err != nil {
 		t.Skip("node not installed")
 	}
-	out, err := exec.Command(node, "--test", "test/").CombinedOutput()
+	out, err := exec.Command(node, "--test", "test/chat.test.mjs").CombinedOutput()
 	if err != nil {
 		t.Fatalf("node --test failed: %v\n%s", err, out)
 	}

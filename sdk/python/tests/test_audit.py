@@ -5,13 +5,14 @@ import pytest
 from lmbp_server import LMBPServer, MemoryStore, SQLiteStore, TenantConfig
 from lmbp_server.store import StoreConflict
 from simdevice import pair_and_connect
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
 
 
 def new(**kw):
-    return LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, **kw)
+    return LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, **kw)
 
 
 def test_idempotency_store_keys_unambiguous(tmp_path):
@@ -151,7 +152,7 @@ async def test_no_ack_without_persistence(serve_app, mode):
     else:
         # Terminal states are written with their event by finish_task (atomic).
         st.finish_task = lambda *a: (_ for _ in ()).throw(OSError("disk full"))
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: logs.append(" ".join(map(str, a))))
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: logs.append(" ".join(map(str, a))))
     async with serve_app(lmbp.asgi()) as base:
         ws, task, _ = await pair_and_connect(lmbp, base, T, "u1")
         async with httpx.AsyncClient(base_url=base, headers={"Authorization": "Bearer " + KEY, "X-End-User": "u1"}) as h:
@@ -199,7 +200,7 @@ async def test_idempotent_duplicate_while_queued(serve_app):
 async def test_idempotent_queue_failure_replayed(serve_app):
     # Reliability 2: a queueing failure is recorded; the replay gets the same error.
     import asyncio
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, queue_timeout=0.15)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, queue_timeout=0.15)
     async with serve_app(lmbp.asgi()) as base:
         ws, task, _ = await _slow(serve_app, lmbp, base)
         hold = asyncio.ensure_future(_post(base, "hold the slot"))

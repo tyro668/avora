@@ -33,8 +33,73 @@ export const RETENTION_DEFAULT = 7 * 24 * 3600_000;
 /** How often the retention pass runs: half the period, between 1 s and 1 h. */
 export const retentionEvery = (ret) => Math.min(3600_000, Math.max(1000, Math.floor(ret / 2)));
 
+/** Pairing abuse limits (spec §6.2–§6.4, §10). */
+export const LIMITS = { authorizePerMinute: 60, maxPendingPerTenant: 1000, maxSlowDowns: 10, failuresPerMinute: 10 };
+const INITIAL_INTERVAL = 2;
+
+/**
+ * JtiCache remembers proof/assertion jtis until they expire. Expired entries
+ * leave from the top of a min-heap ordered by expiry (O(log n) per call),
+ * never by scanning the whole set.
+ */
+export class JtiCache {
+  constructor() { this.seen = new Map(); this.heap = []; }
+  get size() { return this.seen.size; }
+  evict(now) {
+    const h = this.heap;
+    while (h.length && h[0][0] < now) {
+      const [at, j] = this.pop();
+      if (this.seen.get(j) === at) this.seen.delete(j);
+    }
+  }
+  has(j, now = Date.now()) { this.evict(now); return this.seen.has(j); }
+  /** Records j until untilMs; false if it is already recorded. */
+  use(j, untilMs, now = Date.now()) {
+    this.evict(now);
+    if (this.seen.has(j)) return false;
+    this.seen.set(j, untilMs);
+    const h = this.heap;
+    h.push([untilMs, j]);
+    for (let i = h.length - 1; i > 0;) {
+      const p = (i - 1) >> 1;
+      if (h[p][0] <= h[i][0]) break;
+      [h[p], h[i]] = [h[i], h[p]]; i = p;
+    }
+    return true;
+  }
+  pop() {
+    const h = this.heap, top = h[0], last = h.pop();
+    if (h.length) {
+      h[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < h.length && h[l][0] < h[m][0]) m = l;
+        if (r < h.length && h[r][0] < h[m][0]) m = r;
+        if (m === i) break;
+        [h[m], h[i]] = [h[i], h[m]]; i = m;
+      }
+    }
+    return top;
+  }
+}
+
+/** windowCounter counts events per key in fixed one-minute windows (the whole map is dropped when the window rolls). */
+class WindowCounter {
+  constructor() { this.start = 0; this.n = new Map(); }
+  allow(key, limit, now = Date.now()) {
+    if (now - this.start >= 60_000) { this.start = now; this.n = new Map(); }
+    const c = this.n.get(key) || 0;
+    if (c >= limit) return false;
+    this.n.set(key, c + 1);
+    return true;
+  }
+}
+
 export class Gateway {
   constructor(cfg = {}) {
+    // §18.1: the issuer is configuration, never derived from a request's Host.
+    if (!cfg.issuer) throw new Error('lmbp: issuer is required (the gateway\'s public origin, e.g. https://gw.example.com)');
     this.cfg = {
       issuer: cfg.issuer ? L.origin(cfg.issuer) : '', codeTTL: 600, tokenTTL: 900, maxConc: 16, pingInterval: 20_000,
       resumeWindow: 30_000, taskTimeout: 10 * 60_000, slowConsumer: 60_000, attachGrace: 30_000, queueTimeout: 15_000,
@@ -54,9 +119,10 @@ export class Gateway {
     this.tenants = new Map();     // id → {id, name, keyHash, profile}
     this.devs = new Map();        // device id → DState (live / resumable)
     this.tasks = new Map();       // task id → Task hub
-    this.jtis = new Map();
-    this.fails = new Map();
-    this.pending = new Map();
+    this.jtis = new JtiCache();
+    this.fails = new Map();       // tenant \0 end user → failure times (last minute)
+    this.pending = new Map();     // tenant → Map(device_code hash → expiry ms)
+    this.authRate = new WindowCounter();
     this.wss = new WebSocketServer({ noServer: true, maxPayload: L.MAX_FRAME_BYTES, perMessageDeflate: false,
       handleProtocols: (ps) => (ps.has(L.SUBPROTOCOL) ? L.SUBPROTOCOL : false) });
     this.recoverOrphans();
@@ -109,19 +175,10 @@ export class Gateway {
     this.tenants.set(id, { id, name: profile.display_name || id, keyHash: L.shaHex(apiKey), profile });
   }
 
-  issuer(req) {
-    if (this.cfg.issuer) return this.cfg.issuer;
-    const scheme = req.socket.encrypted ? 'https' : 'http';
-    try { return L.origin(`${scheme}://${req.headers.host}`); } catch { return `${scheme}://${String(req.headers.host).toLowerCase()}`; }
-  }
+  // eslint-disable-next-line no-unused-vars
+  issuer(_req) { return this.cfg.issuer; }
 
-  useJTI(j, untilMs) {
-    const t = Date.now();
-    for (const [k, v] of this.jtis) if (t > v) this.jtis.delete(k);
-    if (this.jtis.has(j)) return false;
-    this.jtis.set(j, untilMs);
-    return true;
-  }
+  useJTI(j, untilMs) { return this.jtis.use(j, untilMs); }
 
   verifyAccess(tok, iss) {
     const uc = L.unverifiedClaims(tok);
@@ -228,27 +285,71 @@ export class Gateway {
   // ---------- RFC 8628 pairing ----------
   async authorize(req, res) {
     if (req.method !== 'POST') return oauthError(res, 405, 'invalid_request');
+    // §6.2: limited per client address (the TCP peer) before anything is parsed or stored.
+    if (!this.authRate.allow(req.socket?.remoteAddress || '', LIMITS.authorizePerMinute)) {
+      res.setHeader('Retry-After', '60');
+      return oauthError(res, 429, 'slow_down');
+    }
     const ps = await params(req, 4096);
-    if (!ps || !ps.tenant || (typeof ps.device_name === 'string' ? L.charLen(ps.device_name) : 0) > 100) return oauthError(res, 400, 'invalid_request');
+    if (!ps || !ps.tenant || (ps.device_name !== undefined && !L.validDeviceName(ps.device_name))) return oauthError(res, 400, 'invalid_request');
     let pub;
     try { pub = L.unb64(ps.public_key || ''); } catch { return oauthError(res, 400, 'invalid_request'); }
     if (pub.length !== 32) return oauthError(res, 400, 'invalid_request');
+    if (!L.TENANT_ID_RE.test(ps.tenant) || !this.tenants.has(ps.tenant)) return oauthError(res, 400, 'invalid_client');
     const dc = L.randomID('dc_');
     const d = { codeHash: L.shaHex(dc), userCode: userCode(), tenant: ps.tenant, pub, name: ps.device_name || '', status: 'pending',
-      expires: Date.now() + this.cfg.codeTTL * 1000, interval: 2, lastPoll: 0, deviceID: '', owner: '' };
-    this.store.putDeviceAuth(d);
-    this.pending.set(d.codeHash, d);
+      expires: Date.now() + this.cfg.codeTTL * 1000, interval: INITIAL_INTERVAL, lastPoll: 0, deviceID: '', owner: '' };
+    if (!this.reservePending(d.tenant, d.codeHash, d.expires)) {
+      res.setHeader('Retry-After', '60');
+      return oauthError(res, 429, 'slow_down');
+    }
+    try { this.store.putDeviceAuth(d); } catch (e) { this.releasePending(d.tenant, d.codeHash); throw e; }
     res.setHeader('Cache-Control', 'no-store');
     return json(res, 200, { device_code: dc, user_code: d.userCode, expires_in: this.cfg.codeTTL, interval: d.interval });
   }
 
-  allowAttempt(tenant) {
-    const cut = Date.now() - 60_000;
-    const keep = (this.fails.get(tenant) || []).filter((t) => t > cut);
-    this.fails.set(tenant, keep);
-    return keep.length < 10;
+  // reservePending counts a new pending pairing against its tenant's cap (expired entries are dropped first).
+  reservePending(tenant, hash, expires) {
+    const now = Date.now();
+    let m = this.pending.get(tenant);
+    if (!m) this.pending.set(tenant, (m = new Map()));
+    for (const [h, at] of m) if (now > at) m.delete(h);
+    if (m.size >= LIMITS.maxPendingPerTenant) return false;
+    m.set(hash, expires);
+    return true;
   }
-  recordFailure(tenant) { (this.fails.get(tenant) || this.fails.set(tenant, []).get(tenant)).push(Date.now()); }
+  releasePending(tenant, hash) {
+    const m = this.pending.get(tenant);
+    if (m) { m.delete(hash); if (!m.size) this.pending.delete(tenant); }
+  }
+
+  // Failures are counted per end user of a tenant (§6.4). Node runs each
+  // decision synchronously, so check, decision and record are one step.
+  allowAttempt(tenant, user) {
+    const key = tenant + '\0' + user;
+    const cut = Date.now() - 60_000;
+    const keep = (this.fails.get(key) || []).filter((t) => t > cut);
+    if (keep.length) this.fails.set(key, keep); else this.fails.delete(key);
+    return keep.length < LIMITS.failuresPerMinute;
+  }
+  recordFailure(tenant, user) {
+    const key = tenant + '\0' + user;
+    (this.fails.get(key) || this.fails.set(key, []).get(key)).push(Date.now());
+  }
+
+  // pairLookup returns the pending pairing for a code the end user typed (to
+  // show the device before deciding); a code that is not pending counts as a
+  // failure of that user, like a failed decision. Returns { d } or { error }.
+  pairLookup(tenant, owner, userCode) {
+    if (!this.allowAttempt(tenant, owner)) return { error: { status: 429, code: 'RATE_LIMITED', message: 'too many failed codes; wait a minute' } };
+    const code = normCode(userCode);
+    const d = code ? this.store.deviceAuthByUserCode(tenant, code) : null;
+    if (!d || d.status !== 'pending' || Date.now() > d.expires) {
+      this.recordFailure(tenant, owner);
+      return { error: { status: 404, code: 'BAD_REQUEST', message: 'code invalid, expired or already used' } };
+    }
+    return { d };
+  }
 
   async approve(req, res, err) {
     if (req.method !== 'POST') return err(405, 'BAD_REQUEST', 'POST required');
@@ -267,8 +368,8 @@ export class Gateway {
   // per-tenant failed-code lockout and counts every failure, so no path can
   // brute-force codes. Returns { d } or { error: { status, code, message } }.
   pairDecide(tenant, owner, userCode, deny, jkt) {
-    const fail = (status, code, message) => { this.recordFailure(tenant); return { error: { status, code, message } }; };
-    if (!this.allowAttempt(tenant)) return { error: { status: 429, code: 'RATE_LIMITED', message: 'too many failed codes; wait a minute' } };
+    const fail = (status, code, message) => { this.recordFailure(tenant, owner); return { error: { status, code, message } }; };
+    if (!this.allowAttempt(tenant, owner)) return { error: { status: 429, code: 'RATE_LIMITED', message: 'too many failed codes; wait a minute' } };
     const code = normCode(userCode);
     const d = code ? this.store.deviceAuthByUserCode(tenant, code) : null;
     // §19: a declined pairing cannot be overridden by a later approval.
@@ -286,7 +387,7 @@ export class Gateway {
       this.store.putDevice({ id: d.deviceID, tenant, owner, name: d.name, pub: d.pub, status: 'active', created: new Date(), e2eeKey: '' });
     }
     this.store.putDeviceAuth(d);
-    this.pending.delete(d.codeHash);
+    this.releasePending(tenant, d.codeHash);
     return d;
   }
 
@@ -306,20 +407,26 @@ export class Gateway {
     if (ps.grant_type === 'urn:ietf:params:oauth:grant-type:device_code') {
       const d = this.store.getDeviceAuth(L.shaHex(ps.device_code || ''));
       if (!d) return oauthError(res, 400, 'invalid_grant');
+      let pc;
       try {
-        const pc = L.verifyProof(d.pub, ps.proof, '', L.PROOF.token, ps.device_code);
-        if (!this.useJTI(pc.jti, Date.now() + 180_000)) throw new Error('replay');
+        pc = L.verifyProof(d.pub, ps.proof, '', L.PROOF.token, ps.device_code);
+        if (this.jtis.has(pc.jti)) throw new Error('replay');
       } catch { return oauthError(res, 400, 'invalid_grant'); }
+      // A code that can no longer yield a token answers without remembering the proof's jti.
       if (Date.now() > d.expires) return oauthError(res, 400, 'expired_token');
       if (d.status === 'denied') return oauthError(res, 400, 'access_denied');
       if (d.status === 'consumed') return oauthError(res, 400, 'invalid_grant');
+      if (!this.useJTI(pc.jti, Date.now() + 180_000)) return oauthError(res, 400, 'invalid_grant');
       if (d.status === 'pending') {
         const t = Date.now();
         const slow = t - d.lastPoll < d.interval * 1000 - 200;
         d.lastPoll = t;
         if (slow) d.interval += 5;
+        // §6.3: a device that keeps ignoring slow_down loses its code.
+        const dead = Math.floor((d.interval - INITIAL_INTERVAL) / 5) > LIMITS.maxSlowDowns;
+        if (dead) { d.expires = t; this.releasePending(d.tenant, d.codeHash); }
         this.store.putDeviceAuth(d);
-        return oauthError(res, 400, slow ? 'slow_down' : 'authorization_pending');
+        return oauthError(res, 400, dead ? 'expired_token' : slow ? 'slow_down' : 'authorization_pending');
       }
       const dev = this.store.getDevice(d.deviceID);
       if (!dev) return oauthError(res, 500, 'server_error');
@@ -354,13 +461,8 @@ export class Gateway {
       if (s) Object.assign(item, { online: true, models: [...s.models], model_capabilities: { ...s.modelCaps }, ...(Object.keys(s.modelNames || {}).length ? { model_names: { ...s.modelNames } } : {}), capabilities: [...s.caps], max_concurrency: s.maxConc });
       return item;
     });
-    const now = Date.now(), pending_pairings = [];
-    for (const [h] of this.pending) {
-      const d = this.store.getDeviceAuth(h);
-      if (!d || d.status !== 'pending' || now > d.expires) { this.pending.delete(h); continue; }
-      if (d.tenant === a.t.id) pending_pairings.push({ device_name: d.name, jkt: L.thumbprint(d.pub), expires_at: new Date(d.expires).toISOString().replace(/\.\d+Z$/, 'Z') });
-    }
-    return json(res, 200, { devices: out, pending_pairings });
+    // Pending pairings are never listed (§6.4, §12.6): approval needs the code shown on the device.
+    return json(res, 200, { devices: out });
   }
 
   revoke(req, res, err, id) {
@@ -376,7 +478,7 @@ export class Gateway {
     if (!d || d.tenant !== tenant || d.owner !== owner) return false;
     d.status = 'revoked';
     this.store.putDevice(d);
-    this.dropDevice(id, 'UNAUTHENTICATED', 'device revoked');
+    this.dropDevice(id, 'DEVICE_OFFLINE', 'device revoked'); // in-flight tasks: OUTCOME_UNKNOWN (§7.5)
     return true;
   }
 
@@ -1047,6 +1149,15 @@ class Task {
     if (inp.seq > (this.seen ?? 0)) this.seen = inp.seq;
     let data = inp.data && typeof inp.data === 'object' ? inp.data : {};
     if (inp.type === 'task.delta' && !this.e2ee && data.e2ee) { data = { ...data }; delete data.e2ee; }
+    if (inp.type === 'task.delta') {
+      const why = this.checkDelta(data);
+      if (why) {
+        this.g.cfg.log(`lmbp: task ${this.id}: ${why}`);
+        this.cancel('protocol_error');
+        this.failLocal('INTERNAL', 'device sent an invalid delta: ' + why);
+        return;
+      }
+    }
     const ev = { seq: inp.seq, type: inp.type, data };
     let state = '';
     if (isTerminal(inp.type)) {
@@ -1106,9 +1217,27 @@ class Task {
     this.record({ seq, type: 'task.error', data: errorBody(code, msg, retryable) });
     this.finish(code === 'CANCELLED' ? 'CANCELLED' : 'FAILED', false, false);
   }
+  // failOffline ends a task whose device session is gone, whatever ended it
+  // (disconnect, revocation, replacement): once task.run was sent the device
+  // may have run it, so OUTCOME_UNKNOWN (§7.5); before that DEVICE_OFFLINE
+  // (retryable).
   failOffline(code, msg) {
-    if (code === 'DEVICE_OFFLINE' && this.sentRun) { code = 'OUTCOME_UNKNOWN'; msg += '; outcome unknown'; }
+    if (this.sentRun) { if (code !== 'OUTCOME_UNKNOWN') msg += '; outcome unknown'; code = 'OUTCOME_UNKNOWN'; } else code = 'DEVICE_OFFLINE';
     this.failLocal(code, msg, code === 'DEVICE_OFFLINE');
+  }
+  // checkDelta validates a device delta before it is stored or aggregated:
+  // the tool-call index range (§16.1) and the task's output budget (§10),
+  // which counts every encoded delta body, cleartext or sealed.
+  checkDelta(data) {
+    if (!this.e2ee) {
+      for (const c of Array.isArray(data.tool_calls) ? data.tool_calls : []) {
+        if (c && c.index !== undefined && (!Number.isInteger(c.index) || c.index < 0 || c.index > L.MAX_TOOL_CALL_INDEX))
+          return `tool call index ${c.index} out of range [0,${L.MAX_TOOL_CALL_INDEX}]`;
+      }
+    }
+    this.outBytes = (this.outBytes || 0) + Buffer.byteLength(JSON.stringify(data));
+    if (this.outBytes > L.MAX_TASK_OUTPUT_BYTES) return 'task output exceeds the per-task limit';
+    return '';
   }
   finish(state, fromDevice, writeState = true) {
     if (this.done) return;

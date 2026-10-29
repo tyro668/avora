@@ -218,8 +218,6 @@ if (typeof document !== 'undefined') (function () {
   let busy = null;            // AbortController of the running request
   let pairLink = '', issuer = '';
   let showRevoked = false;    // offline/revoked group expanded
-  let lastPending = [];       // latest pending_pairings
-  const dismissedJkts = new Set();
 
   const ERR = {
     UNAUTHENTICATED: '认证失败：租户 API Key 无效或已失效',
@@ -371,39 +369,21 @@ if (typeof document !== 'undefined') (function () {
   $('code').addEventListener('blur', () => $('codeBox').classList.remove('focus'));
   $('advToggle').onclick = () => { const open = $('advBody').classList.toggle('hidden'); $('advToggle').classList.toggle('open', !open); };
 
-  function updatePairReq(info) {
-    const active = !!info;
-    $('step2').classList.toggle('active', active);
-    $('pairWait').classList.toggle('hidden', !active);
-    $('sn1').className = 'sn ' + (active ? 'done' : 'cur'); $('sn1').textContent = '';
-    if (active) $('sn1').append(icon('check', '#fff', 12, 3)); else $('sn1').textContent = '1';
-    $('sn2').className = 'sn' + (active ? ' cur' : '');
-    $('pairReqTitle').textContent = active ? (info.device_name ? `「${info.device_name}」请求配对` : '桌面端请求配对') : '输入配对码';
-    $('pairReqDesc').textContent = active ? '输入桌面端显示的 8 位配对码，确认是你自己的电脑' : '桌面端发起配对后，输入它显示的 8 位配对码';
+  // Pending pairings are never listed by the gateway (review 2026-10-29): the pairing dialog
+  // opens only when the user asks for it, and the code typed here must be the one the
+  // user's own desktop shows.
+  function updatePairBadge() {
     const n = devices.filter((d) => d.status === 'active').length;
     $('pairBadge').className = 'badge off'; $('pairBadge').textContent = n ? `已配对 ${n} 台` : '未配对';
   }
-  function openPairModal(info) {
-    updatePairReq(info); renderCode();
+  function openPairModal() {
+    updatePairBadge(); renderCode();
     if (!isOpen('pairModal')) { closeModal('devModal'); $('pairModal').classList.remove('hidden'); setTimeout(() => $('code')?.focus(), 20); }
   }
-  function closePairModal() {
-    for (const p of lastPending) if (p.jkt) dismissedJkts.add(p.jkt);
-    closeModal('pairModal');
-  }
+  function closePairModal() { closeModal('pairModal'); }
   $('closePairModal').onclick = closePairModal;
-  $('openPairModal').onclick = () => { clearPairMsg(); openPairModal(lastPending[0] || null); };
+  $('openPairModal').onclick = () => { clearPairMsg(); openPairModal(); };
   for (const id of ['code', 'jkt']) $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); decide(false); } });
-
-  function renderPending(list) {
-    lastPending = list;
-    const activeJkts = new Set(list.map((p) => p.jkt).filter(Boolean));
-    for (const j of [...dismissedJkts]) if (!activeJkts.has(j)) dismissedJkts.delete(j);
-    const unseen = list.find((p) => !p.jkt || !dismissedJkts.has(p.jkt));
-    if (unseen) {
-      if (!isOpen('pairModal')) { clearPairMsg(); openPairModal(unseen); } else updatePairReq(unseen);
-    } else if (isOpen('pairModal')) updatePairReq(list[0] || null);
-  }
 
   async function decide(deny) {
     const user_code = $('code').value.trim();
@@ -412,12 +392,12 @@ if (typeof document !== 'undefined') (function () {
     $('approve').disabled = $('deny').disabled = true;
     try {
       const r = await api('POST', '/lmbp/v1/tenant/devices/approvals', body);
-      pairMsg(r.status === 'approved' ? `已批准：${r.device_name || '设备'}（${r.device_id}），等待设备上线…` : '已拒绝该配对请求，设备将收到 CONSENT_DENIED');
+      // device_name is reported by the device itself: shown as plain text and labelled as such.
+      pairMsg(r.status === 'approved' ? `已批准（设备自报名称：${r.device_name || '未命名'}，设备 ID：${r.device_id}），等待设备上线…` : '已拒绝该配对请求，设备将收到 CONSENT_DENIED');
       $('code').value = ''; $('jkt').value = ''; renderCode();
       if (location.search) window.history.replaceState(null, '', location.pathname);
       if (r.status === 'approved') {
-        if (r.jkt) dismissedJkts.add(r.jkt);
-        toast(`已批准配对：${r.device_name || r.device_id}`);
+        toast(`已批准配对：${r.device_id}`);
         closeModal('pairModal');
       }
       refresh(); setTimeout(refresh, 1500);
@@ -435,7 +415,7 @@ if (typeof document !== 'undefined') (function () {
     try {
       const [d, m] = await Promise.all([api('GET', '/lmbp/v1/tenant/devices'), api('GET', '/v1/models')]);
       devices = d.devices || [];
-      renderPending(d.pending_pairings || []);
+      if (isOpen('pairModal')) updatePairBadge();
       renderDevices(devices); renderModels(m.data || []);
     } catch (e) { if (e.status !== 401) $('devSub').textContent = '加载失败：' + describe(e.code, e.message); }
   }
@@ -445,7 +425,7 @@ if (typeof document !== 'undefined') (function () {
     const card = el('div', 'dc' + (d.online && !revoked ? '' : ' dim'));
     const ic = el('span', 'dic'); ic.append(icon(devIcon(d.name), '#3a3a37', 18));
     const body = el('div'); body.style.cssText = 'flex:1;min-width:0';
-    const nm = el('div', 'nm');
+    const nm = el('div', 'nm'); nm.title = '设备自报名称（由设备提供，仅供参考）';
     nm.append(document.createTextNode(d.name || '(未命名设备)'),
       el('span', 'badge ' + (revoked ? 'rv' : d.online ? 'on' : 'off'), revoked ? '已吊销' : d.online ? '在线' : '离线'), el('span', 'sp'));
     const more = el('button', 'more'); more.type = 'button'; more.title = '更多操作'; more.append(icon('more', '#a3a39f', 16));
@@ -509,7 +489,7 @@ if (typeof document !== 'undefined') (function () {
     }
   }
   $('devInd').onclick = () => {
-    if (!devices.some((d) => d.status === 'active')) { clearPairMsg(); openPairModal(lastPending[0] || null); return; }
+    if (!devices.some((d) => d.status === 'active')) { clearPairMsg(); openPairModal(); return; }
     $('devModal').classList.remove('hidden');
   };
   $('closeDevModal').onclick = $('doneDevModal').onclick = () => closeModal('devModal');

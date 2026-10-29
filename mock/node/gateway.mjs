@@ -9,6 +9,16 @@ import { Gateway } from 'lmbp-server/engine';
 
 export { Gateway, LMBPServer };
 
+// loopbackIssuer is the default issuer for a loopback --listen address; any
+// other address needs an explicit --issuer (spec §18.1).
+function loopbackIssuer(listen) {
+  const i = listen.lastIndexOf(':');
+  const h = listen.slice(0, i).replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '::1' || /^127\./.test(h)) return `http://${listen}`;
+  console.error(`--issuer (or LMBP_ISSUER) is required when listening on ${listen}`);
+  process.exit(2);
+}
+
 async function main() {
   const { values: o } = parseArgs({ options: {
     listen: { type: 'string', default: process.env.LMBP_LISTEN || '127.0.0.1:8080' },
@@ -25,6 +35,8 @@ async function main() {
   } });
   if (o.help) {
     console.log(`usage: node gateway.mjs [--listen host:port] [--issuer https://gw.example] [--tenant id:ENV_VAR]... [--tenant-profiles profiles.json] [--db lmbp.db]
+  --issuer URL          public origin of the gateway (LMBP_ISSUER); required unless --listen is a loopback address,
+                        where it defaults to http://<listen>. Never derived from a request's Host header.
   --tenant id:ENV       register tenant <id> whose API key (>= 32 chars) is read from env var ENV
   --tenant-profiles F   JSON {"<tenant>": {"api_key_env": "...", "display_name": "...", "requested_scopes": [...], ...}}
   --db FILE             persist state in SQLite (better-sqlite3); default in memory
@@ -50,12 +62,12 @@ async function main() {
     }
   }
   if (!tenants.length) console.error('warning: no tenants registered (use --tenant id:ENV_VAR)');
-  const lmbp = new LMBPServer({ tenants, issuer: o.issuer, signingSeed: seedHex ? Buffer.from(seedHex, 'hex') : undefined,
+  const lmbp = new LMBPServer({ tenants, issuer: o.issuer || loopbackIssuer(o.listen), signingSeed: seedHex ? Buffer.from(seedHex, 'hex') : undefined,
     maxConcurrency: Number(o['max-concurrency']), chatUIDir: o['no-chat-ui'] ? '' : o['web-dir'], store: o.db ? new SqliteStore(o.db) : undefined,
     retention: o['retention-seconds'] ? Number(o['retention-seconds']) * 1000 : undefined });
   const i = o.listen.lastIndexOf(':');
   const addr = await lmbp.listen(Number(o.listen.slice(i + 1)), o.listen.slice(0, i) || '0.0.0.0');
-  console.error(`lmbp node mock gateway listening on ${addr.address}:${addr.port} issuer=${lmbp.engine.cfg.issuer || '(request origin, dev mode)'} kid=${lmbp.keys.kid()}`);
+  console.error(`lmbp node mock gateway listening on ${addr.address}:${addr.port} issuer=${lmbp.engine.cfg.issuer} kid=${lmbp.keys.kid()}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('gateway.mjs')) main().catch((e) => { console.error(e.message); process.exit(1); });

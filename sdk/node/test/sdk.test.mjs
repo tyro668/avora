@@ -6,15 +6,17 @@ import path from 'node:path';
 import http from 'node:http';
 import { LMBPServer, SqliteStore, PairingError, anthropic } from '../dist/index.js';
 import { pairAndConnect, startPairing } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const T = 'acme';
 
 async function setup(opts = {}) {
-  const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {}, ...opts });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {}, ...opts });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   return { lmbp, srv, base, close: async () => { srv.closeAllConnections(); await new Promise((ok) => srv.close(ok)); } };
 }
@@ -45,7 +47,7 @@ test('pairing API: link/QR, lookup, approve, list, revoke', async () => {
     assert.match(info.qrSVG, /^<svg/);
     assert.match(info.qrDataURL, /^data:image\/gif;base64,/);
     const p = await startPairing(s.base, T, 'my-laptop');
-    const pend = s.lmbp.pairing.lookup(T, p.user_code.toLowerCase().replace('-', ''));
+    const pend = s.lmbp.pairing.lookup(T, 'u1', p.user_code.toLowerCase().replace('-', ''));
     assert.equal(pend.deviceName, 'my-laptop');
     assert.equal(pend.status, 'pending');
     assert.throws(() => s.lmbp.pairing.approve(T, 'u1', 'BBBB-BBBB'), PairingError);
@@ -100,10 +102,11 @@ test('in-process client: OpenAI and Anthropic, streaming and not', async () => {
 });
 
 test('middleware falls through to next() for unknown paths', async () => {
-  const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY }], log: () => {} });
   const mw = lmbp.middleware();
   const srv = http.createServer((req, res) => mw(req, res, () => { res.end('app'); }));
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   try {
     assert.equal(await (await fetch(base + '/my/app')).text(), 'app');

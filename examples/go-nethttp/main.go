@@ -68,7 +68,7 @@ func main() {
 	}
 	srv, err := lmbpserver.New(ctx, lmbpserver.Options{
 		Tenants:   []lmbpserver.Tenant{{ID: tenant, APIKey: apiKey, Profile: profile}},
-		Issuer:    os.Getenv("LMBP_ISSUER"), // e.g. https://saas.example.com in production
+		Issuer:    os.Getenv("LMBP_ISSUER"), // REQUIRED, e.g. https://saas.example.com
 		Store:     st,
 		Retention: retention,
 	})
@@ -85,17 +85,11 @@ func main() {
 
 	// Your own login decides who the end user is. Demo: a header.
 	user := func(r *http.Request) string { return env2(r.Header.Get("X-Demo-User"), "demo-user") }
-	issuer := func(r *http.Request) string {
-		if v := os.Getenv("LMBP_ISSUER"); v != "" {
-			return v
-		}
-		return "http://" + r.Host
-	}
 
 	app := http.NewServeMux()
 	// ---- 1. pairing ----
 	app.HandleFunc("GET /app/pair", func(w http.ResponseWriter, r *http.Request) {
-		info, err := srv.Pairing.Create(tenant, issuer(r))
+		info, err := srv.Pairing.Create(tenant)
 		reply(w, map[string]string{"link": info.Link, "qr_svg": info.QRSVG}, err)
 	})
 	app.HandleFunc("POST /app/pair/approve", func(w http.ResponseWriter, r *http.Request) {

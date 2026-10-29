@@ -210,6 +210,7 @@ func generate() vectors {
 		map[string]any{"v": Version, "type": "task.ack", "task_id": run.TaskID, "data": map[string]any{"seq": 2}},
 		map[string]any{"v": Version, "type": "task.delta", "task_id": mmRun.TaskID, "seq": 1, "data": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "id": "call_1", "type": "function", "function": map[string]any{"name": "get_weather", "arguments": "{\"city\":\"上海\"}"}}}}},
 		map[string]any{"v": Version, "type": "task.done", "task_id": mmRun.TaskID, "seq": 2, "data": map[string]any{"finish_reason": "tool_calls"}},
+		map[string]any{"v": Version, "type": "task.delta", "task_id": mmRun.TaskID, "seq": 1, "data": map[string]any{"tool_calls": []any{map[string]any{"index": MaxToolCallIndex, "id": "call_128", "type": "function", "function": map[string]any{"name": "get_weather", "arguments": "{}"}}}}},
 		map[string]any{"v": Version, "type": "task.delta", "task_id": e2Run.TaskID, "seq": 1, "data": map[string]any{"e2ee": e2.Chunks[0].Sealed}},
 		map[string]any{"v": Version, "type": "task.done", "task_id": e2Run.TaskID, "seq": 3, "data": map[string]any{"finish_reason": "stop", "usage": map[string]any{"prompt_tokens": 9, "completion_tokens": 2}, "e2ee": e2.Chunks[2].Sealed}},
 		map[string]any{"v": Version, "type": "models.update", "data": map[string]any{"models": []string{"lm/qwen3-8b"}, "model_capabilities": map[string]any{"lm/qwen3-8b": []string{ModelCapTools}}, "max_concurrency": 2, "e2ee_key": e2.KeyStatement.Compact}},
@@ -218,7 +219,7 @@ func generate() vectors {
 	}
 	names := []string{"hello", "welcome", "task.run", "task.delta", "task.done", "task.error", "task.cancel", "ping", "pong", "session.token(request)", "session.token(response)", "models.update", "error",
 		"hello(resume, flow, model_capabilities, e2ee_key)", "welcome(flow, resume)", "task.run(seq 1, references blob b1)", "blob.chunk(seq 2)", "task.ack",
-		"task.delta(tool_calls)", "task.done(tool_calls)", "task.delta(e2ee)", "task.done(e2ee)", "models.update(model_capabilities, e2ee_key)", "error(FLOW_CONTROL)",
+		"task.delta(tool_calls)", "task.done(tool_calls)", "task.delta(tool_calls index 127)", "task.delta(e2ee)", "task.done(e2ee)", "models.update(model_capabilities, e2ee_key)", "error(FLOW_CONTROL)",
 		"unknown type (receivers ignore or answer error, never crash)"}
 	for i, f := range frames {
 		b, _ := json.Marshal(f)
@@ -233,6 +234,7 @@ func generate() vectors {
 		{"task_run_with_data", "task.run payload must only travel inside jws", `{"v":2,"type":"task.run","task_id":"t1","jws":"` + runJWS.Compact + `","data":{"model":"x"}}`},
 		{"delta_without_seq", "task.delta requires seq", `{"v":2,"type":"task.delta","task_id":"t1","data":{"text":"a"}}`},
 		{"seq_zero", "seq starts at 1", `{"v":2,"type":"task.delta","task_id":"t1","seq":0,"data":{"text":"a"}}`},
+		{"tool_call_index_128", "tool_calls[].index is at most 127 (§16.1)", `{"v":2,"type":"task.delta","task_id":"t1","seq":1,"data":{"tool_calls":[{"index":128,"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}}`},
 		{"hello_without_proof", "hello requires proof", `{"v":2,"type":"hello","id":"h1","data":{"device_id":"d","client":"c","models":[],"max_concurrency":1}}`},
 		{"bad_error_code", "error codes are UPPER_SNAKE", `{"v":2,"type":"error","data":{"code":"oops","message":"x"}}`},
 		{"ack_without_seq", "task.ack requires data.seq", `{"v":2,"type":"task.ack","task_id":"t1","data":{}}`},

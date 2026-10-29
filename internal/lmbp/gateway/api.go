@@ -26,9 +26,23 @@ var (
 // NormUserCode normalises a user code as typed by a person (case, dashes, spaces).
 func NormUserCode(s string) string { return normCode(s) }
 
-// PendingPairing returns the pending device authorization for a user code.
-func (g *Gateway) PendingPairing(ctx context.Context, tenantID, userCode string) (store.DeviceAuth, error) {
-	return g.cfg.Store.DeviceAuthByUserCode(ctx, tenantID, normCode(userCode))
+// PendingPairing returns the pending device authorization for a user code,
+// for a signed-in end user who typed it (to show the device before deciding).
+// A code that is not pending counts as a failed attempt of that user, like a
+// failed Decide: the lookup is no oracle for guessing codes.
+func (g *Gateway) PendingPairing(ctx context.Context, tenantID, owner, userCode string) (store.DeviceAuth, error) {
+	g.pairMu.Lock()
+	defer g.pairMu.Unlock()
+	key := failKey(tenantID, owner)
+	if !g.allowAttemptLocked(key) {
+		return store.DeviceAuth{}, ErrRateLimited
+	}
+	d, err := g.cfg.Store.DeviceAuthByUserCode(ctx, tenantID, normCode(userCode))
+	if err != nil || d.Status != "pending" || time.Now().After(d.ExpiresAt) {
+		g.recordFailureLocked(key)
+		return store.DeviceAuth{}, ErrCodeInvalid
+	}
+	return d, nil
 }
 
 // Decide approves (binding the new device to owner) or denies the pairing
@@ -36,15 +50,21 @@ func (g *Gateway) PendingPairing(ctx context.Context, tenantID, userCode string)
 //
 // Failure counting and lockout live here, in the shared business layer, so
 // the HTTP API and in-process callers (SDK Pairing.Approve/Deny) are limited
-// alike: after 10 failed codes per tenant within a minute, Decide returns
-// ErrRateLimited without looking the code up (audit finding 8).
+// alike: after 10 failed codes per end user (tenant + X-End-User) within a
+// minute, Decide returns ErrRateLimited without looking the code up. One
+// lock covers the limit check, the decision and the failure record, so a
+// code is decided at most once (one device per code) and concurrent
+// failures cannot overrun the limit.
 func (g *Gateway) Decide(ctx context.Context, tenantID, owner, userCode, jkt string, deny bool) (store.DeviceAuth, error) {
-	if !g.allowAttempt(tenantID) {
+	g.pairMu.Lock()
+	defer g.pairMu.Unlock()
+	key := failKey(tenantID, owner)
+	if !g.allowAttemptLocked(key) {
 		return store.DeviceAuth{}, ErrRateLimited
 	}
 	d, err := g.decide(ctx, tenantID, owner, userCode, jkt, deny)
 	if errors.Is(err, ErrCodeDenied) || errors.Is(err, ErrCodeInvalid) || errors.Is(err, ErrJKTMismatch) {
-		g.recordFailure(tenantID)
+		g.recordFailureLocked(key)
 	}
 	return d, err
 }
@@ -68,9 +88,7 @@ func (g *Gateway) decide(ctx context.Context, tenantID, owner, userCode, jkt str
 			return d, err
 		}
 	}
-	g.mu.Lock()
-	delete(g.pending, d.DeviceCodeHash)
-	g.mu.Unlock()
+	g.releasePending(tenantID, d.DeviceCodeHash)
 	return d, g.cfg.Store.UpdateDeviceAuth(ctx, d)
 }
 
@@ -83,7 +101,7 @@ func (g *Gateway) RevokeDevice(ctx context.Context, tenantID, owner, id string) 
 	if err := g.cfg.Store.SetDeviceStatus(ctx, id, "revoked"); err != nil {
 		return err
 	}
-	g.dropDevice(id, lmbp.ErrUnauthenticated, "device revoked")
+	g.dropDevice(id, lmbp.ErrDeviceOffline, "device revoked")
 	return nil
 }
 

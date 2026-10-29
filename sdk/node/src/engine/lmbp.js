@@ -13,6 +13,18 @@ export const MAX_CONCURRENCY = 16;
 export const VERSION_REQUIRED = 'LMBP 2.0 required: WebSocket subprotocol lmbp and envelope v 2 (LMBP 1.x is not supported)';
 /** charLen counts Unicode code points, the unit of every string limit (spec §4.1). */
 export const charLen = (s) => [...s].length;
+/** Largest task.delta tool_calls[].index (spec §16.1). */
+export const MAX_TOOL_CALL_INDEX = 127;
+/** Encoded task.delta bytes one task may send, cleartext or sealed (spec §10). */
+export const MAX_TASK_OUTPUT_BYTES = 64 << 20;
+/** device_name: at most 100 code points (spec §6.2). */
+export const MAX_DEVICE_NAME_CHARS = 100;
+// Characters that can disguise text: C0/C1 controls, U+00AD, U+061C, U+180E,
+// zero-width and directional marks, separators and embedding controls,
+// invisible operators, BOM, interlinear annotation controls.
+const DEVICE_NAME_FORBIDDEN = /[\u0000-\u001F\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/u;
+/** validDeviceName: the spec §6.2 rule for the untrusted, device-reported name. */
+export const validDeviceName = (s) => typeof s === 'string' && s.isWellFormed?.() !== false && charLen(s) <= MAX_DEVICE_NAME_CHARS && !DEVICE_NAME_FORBIDDEN.test(s);
 /** validHeader: 1..max printable ASCII (0x20-0x7E), for X-End-User and Idempotency-Key (spec §4.1). */
 export const validHeader = (s, max) => typeof s === 'string' && s.length >= 1 && s.length <= max && /^[\x20-\x7E]+$/.test(s);
 export const CAPABILITIES = ['session.token', 'models.update', 'resume', 'flow', 'tools', 'multimodal', 'e2ee'];

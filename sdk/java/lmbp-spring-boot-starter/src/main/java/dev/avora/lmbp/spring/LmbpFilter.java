@@ -41,7 +41,7 @@ public class LmbpFilter extends OncePerRequestFilter {
     String path = req.getRequestURI().substring(req.getContextPath().length());
     if (!lmbp.handles(path)) { chain.doFilter(req, res); return; }
     if (path.equals(LMBPServer.CONNECT_PATH) && "websocket".equalsIgnoreCase(req.getHeader("Upgrade"))) { chain.doFilter(req, res); return; }
-    HttpRequest r = new HttpRequest(req.getMethod(), path, req.getQueryString(), headers(req), body(req));
+    HttpRequest r = new HttpRequest(req.getMethod(), path, req.getQueryString(), headers(req), body(req)).remoteAddress(req.getRemoteAddr());
     // Async mode frees the container thread; a client disconnect surfaces as a failed write
     // (SSE keep-alives every lmbp.keepalive-ms), as AsyncListener.onError, or through the
     // container probe below (non-streaming requests).

@@ -49,11 +49,16 @@ type Client struct {
 	xpriv    []byte
 	xpub     []byte
 
-	mu          sync.Mutex
-	tasks       map[string]*ctask
-	seen        map[string]time.Time // task nonces and E2EE request ids (replay)
-	out         *lmbp.Outbox         // device→gateway data frames
-	in          *lmbp.Inbound        // gateway→device data frames
+	mu    sync.Mutex
+	tasks map[string]*ctask
+	seen  map[string]time.Time // task nonces and E2EE request ids (replay)
+	// started bounds the in-memory replay cache across restarts: task.run
+	// frames and sealed requests issued before it (creation time minus
+	// replaySkew, Unix seconds) are refused, so a restart cannot reopen the
+	// replay window of anything a previous process may have accepted.
+	started     int64
+	out         *lmbp.Outbox  // device→gateway data frames
+	in          *lmbp.Inbound // gateway→device data frames
 	resumeToken string
 	resumeUntil time.Time
 	maxConc     int    // effective: min(want, gateway cap)
@@ -88,6 +93,10 @@ type ctask struct {
 	cancel   context.CancelFunc
 }
 
+// replaySkew tolerates whole-second iat truncation and sub-second clock
+// differences between this device and the gateway or SaaS.
+const replaySkew = 2
+
 func New(cfg Config, id Identity) (*Client, error) {
 	k, g, err := id.keys()
 	if err != nil {
@@ -112,7 +121,7 @@ func New(cfg Config, id Identity) (*Client, error) {
 	if cfg.Capabilities == nil {
 		cfg.Capabilities = lmbp.Capabilities
 	}
-	c := &Client{quit: make(chan struct{}), cfg: cfg, id: id, key: k, gw: g, tasks: map[string]*ctask{}, seen: map[string]time.Time{}, out: lmbp.NewOutbox(), in: lmbp.NewInbound(cfg.Flow), maxConc: cfg.MaxConcurrency, wantConc: cfg.MaxConcurrency}
+	c := &Client{quit: make(chan struct{}), cfg: cfg, id: id, key: k, gw: g, tasks: map[string]*ctask{}, seen: map[string]time.Time{}, started: time.Now().Unix() - replaySkew, out: lmbp.NewOutbox(), in: lmbp.NewInbound(cfg.Flow), maxConc: cfg.MaxConcurrency, wantConc: cfg.MaxConcurrency}
 	if id.E2EEKey != "" {
 		if x, err := lmbp.UnB64(id.E2EEKey); err == nil {
 			if pub, err := lmbp.X25519Public(x); err == nil {
@@ -722,6 +731,12 @@ func (c *Client) onRun(e lmbp.Envelope) {
 		c.finish(t, nil, &lmbp.ErrorBody{Code: lmbp.ErrBadRequest, Message: "task not for this device or expired"})
 		return
 	}
+	if run.Iat < c.started {
+		// Issued before this process: its nonce may have been used by a
+		// previous run whose replay cache is gone (§12.4).
+		c.finish(t, nil, &lmbp.ErrorBody{Code: lmbp.ErrForbidden, Message: "task.run predates this device session (possible replay)"})
+		return
+	}
 	allowed := contains(c.cfg.Executor.Models(), run.Model)
 	c.mu.Lock()
 	now := time.Now()
@@ -1048,6 +1063,9 @@ func (c *Client) openE2EE(run lmbp.TaskRun, blobs map[string][]byte) (lmbp.TaskR
 	now := time.Now().Unix()
 	if now-req.Iat > lmbp.E2EEMaxAge || req.Iat > now+60 {
 		return bad("sealed request is stale")
+	}
+	if req.Iat < c.started {
+		return bad("sealed request predates this device session (possible replay)")
 	}
 	key, err := lmbp.UnB64(req.ResponseKey)
 	if err != nil || len(key) != 32 {

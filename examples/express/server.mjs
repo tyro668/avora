@@ -22,9 +22,12 @@ if (!apiKey) throw new Error('set TENANT_API_KEY (>= 32 chars; server-side secre
 const profile = process.env.TENANT_PROFILE_FILE ? JSON.parse(fs.readFileSync(process.env.TENANT_PROFILE_FILE, 'utf8'))[tenant]
   : { display_name: 'Acme Chat (Express)', requested_scopes: ['lmbp.chat', 'lmbp.tools', 'lmbp.vision'] };
 
+// The gateway's public origin (iss of every token): configuration, never the request's Host header.
+const issuer = process.env.LMBP_ISSUER || (host === '127.0.0.1' || host === 'localhost' ? `http://${host}:${port}` : '');
+if (!issuer) throw new Error('set LMBP_ISSUER (e.g. https://saas.example.com)');
 const lmbp = new LMBPServer({
   tenants: [{ id: tenant, apiKey, profile }],
-  issuer: process.env.LMBP_ISSUER,                         // e.g. https://saas.example.com in production
+  issuer,
   store: process.env.LMBP_DB ? new SqliteStore(process.env.LMBP_DB) : undefined,
   // finished tasks + idempotency records: 7 days unless set (negative disables)
   retention: process.env.LMBP_RETENTION_SECONDS ? Number(process.env.LMBP_RETENTION_SECONDS) * 1000 : undefined,
@@ -36,10 +39,9 @@ app.use(express.json());
 
 // Your own login decides who the end user is. Demo: a header.
 const user = (req) => req.get('x-demo-user') || 'demo-user';
-const issuer = (req) => process.env.LMBP_ISSUER || `${req.protocol}://${req.get('host')}`;
 
 // ---- 1. pairing ----
-app.get('/app/pair', (req, res) => res.json(lmbp.pairing.create(tenant, issuer(req))));
+app.get('/app/pair', (req, res) => res.json(lmbp.pairing.create(tenant)));
 app.post('/app/pair/approve', (req, res) => {
   try { res.json(lmbp.pairing.approve(tenant, user(req), req.body.user_code)); } catch (e) {
     if (e instanceof PairingError) return res.status(e.code === 'NOT_FOUND' ? 404 : 400).json({ error: e.message });

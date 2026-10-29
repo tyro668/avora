@@ -81,7 +81,9 @@ func TestUnaddressableSavedSchemeIsSkippedWithWarning(t *testing.T) {
 	}
 }
 
-func TestDeleteAdapterClearsUsageStats(t *testing.T) {
+// Spec §20: audit rows are removed only by retention or an explicit purge.
+// Deleting a scheme (adapter) must keep the rows of the requests it served.
+func TestDeleteAdapterKeepsAuditRecords(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	f := filepath.Join(dir, "adapters.enc")
@@ -109,7 +111,11 @@ func TestDeleteAdapterClearsUsageStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bs) != 1 || bs[0].Adapter != a1.ID {
-		t.Fatalf("expected only %s usage to remain after deleting ol, got %+v", a1.ID, bs)
+	if len(bs) != 2 {
+		t.Fatalf("deleting scheme ol removed audit records: %+v", bs)
+	}
+	rows, err := x.AuditList(ctx, audit.Filter{})
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("audit rows after deleting ol: %d %v", len(rows), err)
 	}
 }

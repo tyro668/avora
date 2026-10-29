@@ -93,29 +93,3 @@ func TestStatsByConnectionSeparatesGateways(t *testing.T) {
 		t.Fatalf("buckets %+v", bs)
 	}
 }
-
-func TestDeleteByAdapter(t *testing.T) {
-	ctx := context.Background()
-	l, err := Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	for _, m := range []string{"scheme_1/gpt-4o", "scheme_1/gpt-4o-mini", "schemeX1/other", "codex/gpt-5"} {
-		adapter, _, _ := strings.Cut(m, "/")
-		if err := l.Record(ctx, Record{At: time.Now(), ConnectionID: "dev_1", Gateway: "https://gw.a", Tenant: "acme", TaskID: "t", Model: m, Adapter: adapter, Status: StatusOK, PromptTokens: 10, CompletionTokens: 5, UsageReported: true}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	n, err := l.DeleteByAdapter(ctx, "scheme_1")
-	if err != nil || n != 2 {
-		t.Fatalf("DeleteByAdapter: n=%d err=%v", n, err)
-	}
-	byAdapter, err := l.Stats(ctx, Filter{}, []string{ByAdapter}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(byAdapter) != 2 || byAdapter[0].Adapter != "codex" || byAdapter[1].Adapter != "schemeX1" {
-		t.Fatalf("remaining adapters: %+v", byAdapter)
-	}
-}

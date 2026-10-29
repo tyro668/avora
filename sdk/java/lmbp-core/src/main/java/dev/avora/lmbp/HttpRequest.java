@@ -22,6 +22,8 @@ public final class HttpRequest {
   final byte[] body;
   final Gateway.Abort abort = new Gateway.Abort();
   volatile Gateway gateway;
+  /** TCP peer address (set by the transport adapter; forwarding headers are not trusted). */
+  String remoteAddr = "";
   /** Set by the in-process client: the call is already authenticated as this tenant/user. */
   String trustedTenant, trustedUser;
 
@@ -35,6 +37,9 @@ public final class HttpRequest {
     }
     this.body = body;
   }
+
+  /** Records the client's TCP peer address (used for the §6.2 pairing rate limit). */
+  public HttpRequest remoteAddress(String addr) { this.remoteAddr = addr == null ? "" : addr; return this; }
 
   public String method() { return method; }
   public String path() { return path; }

@@ -70,6 +70,48 @@ final class Gateway {
 
   static final class Abort { volatile boolean aborted; }
 
+  /** Pairing abuse limits (spec §6.2-§6.4, §10). */
+  static final int AUTHORIZE_PER_MINUTE = 60, MAX_PENDING_PER_TENANT = 1000, MAX_SLOW_DOWNS = 10, FAILURES_PER_MINUTE = 10, INITIAL_INTERVAL = 2;
+
+  /**
+   * Remembers proof/assertion jtis until they expire. Expired entries leave from the top of a
+   * min-heap ordered by expiry (O(log n) per call), never by scanning the whole set.
+   */
+  static final class JtiCache {
+    private final Map<String, Long> seen = new HashMap<>();
+    private final java.util.PriorityQueue<Object[]> heap = new java.util.PriorityQueue<>((a, b) -> Long.compare((Long) a[0], (Long) b[0]));
+    private void evict(long now) {
+      while (!heap.isEmpty() && (Long) heap.peek()[0] < now) {
+        Object[] e = heap.poll();
+        Long at = seen.get((String) e[1]);
+        if (at != null && at.equals(e[0])) seen.remove((String) e[1]);
+      }
+    }
+    synchronized boolean has(String j) { evict(System.currentTimeMillis()); return seen.containsKey(j); }
+    synchronized boolean use(String j, long untilMs) {
+      evict(System.currentTimeMillis());
+      if (seen.containsKey(j)) return false;
+      seen.put(j, untilMs);
+      heap.add(new Object[] {untilMs, j});
+      return true;
+    }
+    synchronized int size() { return seen.size(); }
+  }
+
+  /** Counts events per key in fixed one-minute windows (the whole map is dropped when the window rolls). */
+  static final class WindowCounter {
+    private long start;
+    private Map<String, Integer> n = new HashMap<>();
+    synchronized boolean allow(String key, int limit) {
+      long now = System.currentTimeMillis();
+      if (now - start >= 60_000) { start = now; n = new HashMap<>(); }
+      int c = n.getOrDefault(key, 0);
+      if (c >= limit) return false;
+      n.put(key, c + 1);
+      return true;
+    }
+  }
+
   static final class Config {
     String issuer = "";
     long codeTTL = 600, tokenTTL = 900;
@@ -94,15 +136,18 @@ final class Gateway {
   final Map<String, Tenant> tenants = new LinkedHashMap<>();
   final Map<String, DState> devs = new HashMap<>();
   final Map<String, Task> tasks = new HashMap<>();
-  final Map<String, Long> jtis = new HashMap<>();
-  final Map<String, List<Long>> fails = new HashMap<>();
-  final Map<String, Store.DeviceAuth> pending = new LinkedHashMap<>();
+  final JtiCache jtis = new JtiCache();
+  final Map<String, List<Long>> fails = new HashMap<>();              // tenant \0 end user -> failure times (last minute)
+  final Map<String, Map<String, Long>> pending = new HashMap<>();     // tenant -> device_code hash -> expiry
+  final WindowCounter authRate = new WindowCounter();
 
   Gateway(Config cfg, byte[] seed, Store store, Consumer<String> logger) {
     this.cfg = cfg;
     this.store = store;
     this.logger = logger;
-    if (!cfg.issuer.isEmpty()) cfg.issuer = Lmbp.origin(cfg.issuer);
+    // §18.1: the issuer is configuration, never derived from a request's Host.
+    if (cfg.issuer == null || cfg.issuer.isEmpty()) throw new IllegalArgumentException("issuer is required (the gateway's public origin, e.g. https://gw.example.com)");
+    cfg.issuer = Lmbp.origin(cfg.issuer);
     if (seed == null) {
       seed = store.getSecret("signing_seed");
       if (seed == null || seed.length != 32) { seed = new byte[32]; Lmbp.RNG.nextBytes(seed); store.putSecret("signing_seed", seed); }
@@ -199,19 +244,9 @@ final class Gateway {
     tenants.put(id, new Tenant(id, name, Lmbp.shaHex(apiKey), profile));
   }
 
-  String issuer(HttpRequest req) {
-    if (!cfg.issuer.isEmpty()) return cfg.issuer;
-    String host = req.header("host");
-    try { return Lmbp.origin("http://" + host); } catch (RuntimeException e) { return "http://" + host.toLowerCase(); }
-  }
+  String issuer(HttpRequest req) { return cfg.issuer; }
 
-  boolean useJTI(String j, long untilMs) {
-    long t = System.currentTimeMillis();
-    jtis.values().removeIf(v -> t > v);
-    if (jtis.containsKey(j)) return false;
-    jtis.put(j, untilMs);
-    return true;
-  }
+  boolean useJTI(String j, long untilMs) { return jtis.use(j, untilMs); }
 
   Map<String, Object> verifyAccess(Object tok, String iss) {
     Map<String, Object> uc = Lmbp.unverifiedClaims(tok);
@@ -338,30 +373,65 @@ final class Gateway {
   // ---------- RFC 8628 pairing ----------
   void authorize(HttpRequest req, Http.Res res) {
     if (!req.method.equals("POST")) { oauthError(res, 405, "invalid_request"); return; }
+    // §6.2: limited per client address (the TCP peer) before anything is parsed or stored.
+    if (!authRate.allow(req.remoteAddr, AUTHORIZE_PER_MINUTE)) { res.setHeader("Retry-After", "60"); oauthError(res, 429, "slow_down"); return; }
     Map<String, String> ps = params(req, 4096);
-    if (ps == null || ps.get("tenant") == null || ps.get("tenant").isEmpty() || (ps.get("device_name") != null && Lmbp.charLen(ps.get("device_name")) > 100)) { oauthError(res, 400, "invalid_request"); return; }
+    if (ps == null || ps.get("tenant") == null || ps.get("tenant").isEmpty() || (ps.get("device_name") != null && !Lmbp.validDeviceName(ps.get("device_name")))) { oauthError(res, 400, "invalid_request"); return; }
     byte[] pub;
     try { pub = Lmbp.unb64(ps.getOrDefault("public_key", "")); } catch (RuntimeException e) { oauthError(res, 400, "invalid_request"); return; }
     if (pub.length != 32) { oauthError(res, 400, "invalid_request"); return; }
+    if (!tenants.containsKey(ps.get("tenant"))) { oauthError(res, 400, "invalid_client"); return; }
     String dc = Lmbp.randomID("dc_");
     Store.DeviceAuth d = new Store.DeviceAuth();
     d.codeHash = Lmbp.shaHex(dc); d.userCode = userCode(); d.tenant = ps.get("tenant"); d.pub = pub; d.name = ps.getOrDefault("device_name", "");
-    d.status = "pending"; d.expires = System.currentTimeMillis() + cfg.codeTTL * 1000; d.interval = 2;
-    store.putDeviceAuth(d);
-    pending.put(d.codeHash, d);
+    d.status = "pending"; d.expires = System.currentTimeMillis() + cfg.codeTTL * 1000; d.interval = INITIAL_INTERVAL;
+    if (!reservePending(d.tenant, d.codeHash, d.expires)) { res.setHeader("Retry-After", "60"); oauthError(res, 429, "slow_down"); return; }
+    try { store.putDeviceAuth(d); } catch (RuntimeException e) { releasePending(d.tenant, d.codeHash); throw e; }
     res.setHeader("Cache-Control", "no-store");
     json(res, 200, Json.obj("device_code", dc, "user_code", d.userCode, "expires_in", cfg.codeTTL, "interval", (long) d.interval));
   }
 
-  boolean allowAttempt(String tenant) {
-    long cut = System.currentTimeMillis() - 60_000;
-    List<Long> keep = new ArrayList<>();
-    for (long t : fails.getOrDefault(tenant, List.of())) if (t > cut) keep.add(t);
-    fails.put(tenant, keep);
-    return keep.size() < 10;
+  /** Counts a new pending pairing against its tenant's cap (expired entries are dropped first). */
+  boolean reservePending(String tenant, String hash, long expires) {
+    long now = System.currentTimeMillis();
+    Map<String, Long> m = pending.computeIfAbsent(tenant, k -> new HashMap<>());
+    m.values().removeIf(at -> now > at);
+    if (m.size() >= MAX_PENDING_PER_TENANT) return false;
+    m.put(hash, expires);
+    return true;
   }
 
-  void recordFailure(String tenant) { fails.computeIfAbsent(tenant, k -> new ArrayList<>()).add(System.currentTimeMillis()); }
+  void releasePending(String tenant, String hash) {
+    Map<String, Long> m = pending.get(tenant);
+    if (m != null) { m.remove(hash); if (m.isEmpty()) pending.remove(tenant); }
+  }
+
+  // Failures are counted per end user of a tenant (§6.4). Callers hold the engine lock, so the
+  // check, the decision and the record are one atomic step: a code is decided once.
+  boolean allowAttempt(String tenant, String user) {
+    String key = tenant + "\0" + user;
+    long cut = System.currentTimeMillis() - 60_000;
+    List<Long> keep = new ArrayList<>();
+    for (long t : fails.getOrDefault(key, List.of())) if (t > cut) keep.add(t);
+    if (keep.isEmpty()) fails.remove(key); else fails.put(key, keep);
+    return keep.size() < FAILURES_PER_MINUTE;
+  }
+
+  void recordFailure(String tenant, String user) { fails.computeIfAbsent(tenant + "\0" + user, k -> new ArrayList<>()).add(System.currentTimeMillis()); }
+
+  /**
+   * The pending pairing for a code the end user typed (to show the device before deciding). A code
+   * that is not pending counts as a failure of that user, like a failed decision. Engine lock held.
+   */
+  PairResult pairLookup(String tenant, String owner, String userCode) {
+    PairResult r = new PairResult();
+    if (!allowAttempt(tenant, owner)) { r.status = 429; r.code = "RATE_LIMITED"; r.message = "too many failed codes; wait a minute"; return r; }
+    String code = normCode(userCode == null ? "" : userCode);
+    Store.DeviceAuth d = code.isEmpty() ? null : store.deviceAuthByUserCode(tenant, code);
+    if (d == null || !d.status.equals("pending") || System.currentTimeMillis() > d.expires) return fail(r, tenant, owner, 404, "BAD_REQUEST", "code invalid, expired or already used");
+    r.d = d;
+    return r;
+  }
 
   void approve(HttpRequest req, Http.Res res, Err err) {
     if (!req.method.equals("POST")) { err.send(405, "BAD_REQUEST", "POST required"); return; }
@@ -380,23 +450,23 @@ final class Gateway {
 
   static final class PairResult { Store.DeviceAuth d; int status; String code, message; }
 
-  /** The one entry for approving/denying a user code; enforces the per-tenant failed-code lockout. */
+  /** The one entry for approving/denying a user code; enforces the per-user failed-code lockout. */
   PairResult pairDecide(String tenant, String owner, String userCode, boolean deny, String jkt) {
     PairResult r = new PairResult();
-    if (!allowAttempt(tenant)) { r.status = 429; r.code = "RATE_LIMITED"; r.message = "too many failed codes; wait a minute"; return r; }
+    if (!allowAttempt(tenant, owner)) { r.status = 429; r.code = "RATE_LIMITED"; r.message = "too many failed codes; wait a minute"; return r; }
     String code = normCode(userCode);
     Store.DeviceAuth d = code.isEmpty() ? null : store.deviceAuthByUserCode(tenant, code);
     long now = System.currentTimeMillis();
     // §19: a declined pairing cannot be overridden by a later approval.
-    if (d != null && d.status.equals("denied") && now <= d.expires) return fail(r, tenant, 403, "CONSENT_DENIED", "pairing consent was denied for this code");
-    if (d == null || !d.status.equals("pending") || now > d.expires) return fail(r, tenant, 404, "BAD_REQUEST", "code invalid, expired or already used");
-    if (jkt != null && !jkt.equals(Lmbp.thumbprint(d.pub))) return fail(r, tenant, 409, "FORBIDDEN", "device key thumbprint does not match the pairing request");
+    if (d != null && d.status.equals("denied") && now <= d.expires) return fail(r, tenant, owner, 403, "CONSENT_DENIED", "pairing consent was denied for this code");
+    if (d == null || !d.status.equals("pending") || now > d.expires) return fail(r, tenant, owner, 404, "BAD_REQUEST", "code invalid, expired or already used");
+    if (jkt != null && !jkt.equals(Lmbp.thumbprint(d.pub))) return fail(r, tenant, owner, 409, "FORBIDDEN", "device key thumbprint does not match the pairing request");
     r.d = decide(d, tenant, owner, deny);
     return r;
   }
 
-  PairResult fail(PairResult r, String tenant, int status, String code, String msg) {
-    recordFailure(tenant);
+  PairResult fail(PairResult r, String tenant, String owner, int status, String code, String msg) {
+    recordFailure(tenant, owner);
     r.status = status; r.code = code; r.message = msg;
     return r;
   }
@@ -410,7 +480,7 @@ final class Gateway {
       store.putDevice(dev);
     }
     store.putDeviceAuth(d);
-    pending.remove(d.codeHash);
+    releasePending(tenant, d.codeHash);
     return d;
   }
 
@@ -431,20 +501,27 @@ final class Gateway {
     if (gt.equals("urn:ietf:params:oauth:grant-type:device_code")) {
       Store.DeviceAuth d = store.getDeviceAuth(Lmbp.shaHex(ps.getOrDefault("device_code", "")));
       if (d == null) { oauthError(res, 400, "invalid_grant"); return; }
+      String jti;
       try {
         Map<String, Object> pc = Lmbp.verifyProof(d.pub, ps.get("proof"), "", Lmbp.PROOF_TOKEN, ps.get("device_code"));
-        if (!useJTI(String.valueOf(pc.get("jti")), System.currentTimeMillis() + 180_000)) throw new IllegalArgumentException("replay");
+        jti = String.valueOf(pc.get("jti"));
+        if (jtis.has(jti)) throw new IllegalArgumentException("replay");
       } catch (RuntimeException e) { oauthError(res, 400, "invalid_grant"); return; }
+      // A code that can no longer yield a token answers without remembering the proof's jti.
       long now = System.currentTimeMillis();
       if (now > d.expires) { oauthError(res, 400, "expired_token"); return; }
       if (d.status.equals("denied")) { oauthError(res, 400, "access_denied"); return; }
       if (d.status.equals("consumed")) { oauthError(res, 400, "invalid_grant"); return; }
+      if (!useJTI(jti, now + 180_000)) { oauthError(res, 400, "invalid_grant"); return; }
       if (d.status.equals("pending")) {
         boolean slow = now - d.lastPoll < d.interval * 1000L - 200;
         d.lastPoll = now;
         if (slow) d.interval += 5;
+        // §6.3: a device that keeps ignoring slow_down loses its code.
+        boolean dead = (d.interval - INITIAL_INTERVAL) / 5 > MAX_SLOW_DOWNS;
+        if (dead) { d.expires = now; releasePending(d.tenant, d.codeHash); }
         store.putDeviceAuth(d);
-        oauthError(res, 400, slow ? "slow_down" : "authorization_pending");
+        oauthError(res, 400, dead ? "expired_token" : slow ? "slow_down" : "authorization_pending");
         return;
       }
       Store.Device dev = store.getDevice(d.deviceID);
@@ -491,16 +568,8 @@ final class Gateway {
       }
       out.add(item);
     }
-    long now = System.currentTimeMillis();
-    List<Object> pend = new ArrayList<>();
-    for (var it = pending.entrySet().iterator(); it.hasNext(); ) {
-      String h = it.next().getKey();
-      Store.DeviceAuth d = store.getDeviceAuth(h);
-      if (d == null || !d.status.equals("pending") || now > d.expires) { it.remove(); continue; }
-      if (d.tenant.equals(a.t().id()))
-        pend.add(Json.obj("device_name", d.name, "jkt", Lmbp.thumbprint(d.pub), "expires_at", Instant.ofEpochMilli(d.expires).truncatedTo(ChronoUnit.SECONDS).toString()));
-    }
-    json(res, 200, Json.obj("devices", out, "pending_pairings", pend));
+    // Pending pairings are never listed (§6.4, §12.6): approval needs the code shown on the device.
+    json(res, 200, Json.obj("devices", out));
   }
 
   void revoke(HttpRequest req, Http.Res res, Err err, String id) {
@@ -525,7 +594,7 @@ final class Gateway {
     if (d == null || !d.tenant.equals(tenant) || !d.owner.equals(owner)) return false;
     d.status = "revoked";
     store.putDevice(d);
-    dropDevice(id, "UNAUTHENTICATED", "device revoked");
+    dropDevice(id, "DEVICE_OFFLINE", "device revoked"); // in-flight tasks: OUTCOME_UNKNOWN (§7.5)
     return true;
   }
 
@@ -1506,6 +1575,15 @@ final class Gateway {
       if (data == null) data = Json.obj();
       String type = (String) inp.get("type");
       if (type.equals("task.delta") && !e2ee && Json.truthy(data.get("e2ee"))) { data = new LinkedHashMap<>(data); data.remove("e2ee"); }
+      if (type.equals("task.delta")) {
+        String why = checkDelta(data);
+        if (!why.isEmpty()) {
+          g.log("lmbp: task " + id + ": " + why);
+          cancel("protocol_error");
+          failLocal("INTERNAL", "device sent an invalid delta: " + why, false);
+          return;
+        }
+      }
       Store.Event ev = new Store.Event(seq, type, data);
       String state = "";
       if (isTerminal(type)) {
@@ -1569,9 +1647,34 @@ final class Gateway {
       finish(code.equals("CANCELLED") ? "CANCELLED" : "FAILED", false);
     }
 
+    /**
+     * Ends a task whose device session is gone, whatever ended it (disconnect, revocation,
+     * replacement): once task.run was sent the device may have run it, so OUTCOME_UNKNOWN (§7.5);
+     * before that DEVICE_OFFLINE (retryable).
+     */
     void failOffline(String code, String msg) {
-      if (code.equals("DEVICE_OFFLINE") && sentRun) { code = "OUTCOME_UNKNOWN"; msg += "; outcome unknown"; }
+      if (sentRun) { if (!code.equals("OUTCOME_UNKNOWN")) msg += "; outcome unknown"; code = "OUTCOME_UNKNOWN"; } else code = "DEVICE_OFFLINE";
       failLocal(code, msg, code.equals("DEVICE_OFFLINE"));
+    }
+
+    long outBytes;
+
+    /**
+     * Validates a device delta before it is stored or aggregated: the tool-call index range
+     * (§16.1) and the task's output budget (§10), which counts every encoded delta body, cleartext
+     * or sealed.
+     */
+    String checkDelta(Map<String, Object> data) {
+      if (!e2ee && data.get("tool_calls") instanceof List<?> calls) {
+        for (Object c : calls) {
+          if (!(c instanceof Map<?, ?> m) || !m.containsKey("index")) continue;
+          Object ix = m.get("index");
+          if (!Json.isInteger(ix) || Json.longOf(ix) < 0 || Json.longOf(ix) > Lmbp.MAX_TOOL_CALL_INDEX)
+            return "tool call index " + Json.stringify(ix) + " out of range [0," + Lmbp.MAX_TOOL_CALL_INDEX + "]";
+        }
+      }
+      outBytes += Json.stringify(data).getBytes(StandardCharsets.UTF_8).length;
+      return outBytes > Lmbp.MAX_TASK_OUTPUT_BYTES ? "task output exceeds the per-task limit" : "";
     }
 
     void finish(String state, boolean fromDevice) {

@@ -309,18 +309,6 @@ func (l *Log) Purge(ctx context.Context, cutoff time.Time) (int64, error) {
 	return res.RowsAffected()
 }
 
-// DeleteByAdapter deletes all rows belonging to a local adapter (scheme) id.
-func (l *Log) DeleteByAdapter(ctx context.Context, adapter string) (int64, error) {
-	if adapter == "" {
-		return 0, nil
-	}
-	res, err := l.db.ExecContext(ctx, `DELETE FROM requests WHERE adapter=? OR substr(model,1,?)=?`, adapter, len(adapter)+1, adapter+"/")
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
 // RunRetention purges rows older than keep every interval until ctx ends.
 func (l *Log) RunRetention(ctx context.Context, keep, every time.Duration) {
 	if keep <= 0 {

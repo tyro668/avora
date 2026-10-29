@@ -9,6 +9,7 @@ import http from 'node:http';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
 import * as L from '../dist/engine/lmbp.js';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const until = async (cond, ms, what) => {
@@ -17,10 +18,11 @@ const until = async (cond, ms, what) => {
 };
 
 test('local cancel: late device frames and terminal frame are ACKed (credit returned)', async () => {
-  const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   const runs = new Map(); // task id → { acked, cancels: [], sent }
   const manual = (run, ws) => {

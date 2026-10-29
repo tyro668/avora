@@ -13,6 +13,7 @@ import asyncio
 import base64
 import binascii
 import datetime
+import heapq
 import hmac
 import json
 import os
@@ -97,8 +98,8 @@ def api_error(status, code, message):
     return json_resp(status, {"error": {"message": message, "type": "lmbp_error", "code": code}})
 
 
-def oauth_error(status, error):
-    return json_resp(status, {"error": error}, {"Cache-Control": "no-store"})
+def oauth_error(status, error, headers=None):
+    return json_resp(status, {"error": error}, {"Cache-Control": "no-store", **(headers or {})})
 
 
 class HTTPDone(Exception):
@@ -432,6 +433,13 @@ class Task:
         data = inp.get("data") if isinstance(inp.get("data"), dict) else {}
         if inp["type"] == "task.delta" and not self.e2ee and data.get("e2ee"):
             data = {k: v for k, v in data.items() if k != "e2ee"}
+        if inp["type"] == "task.delta":
+            why = self.check_delta(data)
+            if why:
+                self.g.log(f"lmbp: task {self.id}: {why}")
+                self.cancel("protocol_error")
+                self.fail_local("INTERNAL", "device sent an invalid delta: " + why)
+                return None
         ev = {"seq": inp["seq"], "type": inp["type"], "data": data}
         state = ""
         if is_terminal(inp["type"]):
@@ -507,9 +515,32 @@ class Task:
         self.finish("CANCELLED" if code == "CANCELLED" else "FAILED", False, write_state=False)
 
     def fail_offline(self, code, msg):
-        if code == "DEVICE_OFFLINE" and self.sent_run:
-            code, msg = "OUTCOME_UNKNOWN", msg + "; outcome unknown"
+        """End a task whose device session is gone, whatever ended it
+        (disconnect, revocation, replacement): once task.run was sent the
+        device may have run it, so OUTCOME_UNKNOWN (§7.5); before that
+        DEVICE_OFFLINE (retryable)."""
+        if self.sent_run:
+            if code != "OUTCOME_UNKNOWN":
+                msg += "; outcome unknown"
+            code = "OUTCOME_UNKNOWN"
+        else:
+            code = "DEVICE_OFFLINE"
         self.fail_local(code, msg, code == "DEVICE_OFFLINE")
+
+    def check_delta(self, data):
+        """Validate a device delta before it is stored or aggregated: the
+        tool-call index range (§16.1) and the task's output budget (§10),
+        which counts every encoded delta body, cleartext or sealed."""
+        if not self.e2ee:
+            for c in data.get("tool_calls") or []:
+                if isinstance(c, dict) and "index" in c:
+                    i = c["index"]
+                    if not L.is_int(i) or i < 0 or i > L.MAX_TOOL_CALL_INDEX:
+                        return f"tool call index {i} out of range [0,{L.MAX_TOOL_CALL_INDEX}]"
+        self.out_bytes = getattr(self, "out_bytes", 0) + len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode())
+        if self.out_bytes > L.MAX_TASK_OUTPUT_BYTES:
+            return "task output exceeds the per-task limit"
+        return ""
 
     def finish(self, state, from_device, write_state=True):
         if self.done:
@@ -603,9 +634,71 @@ class Task:
             self.detach(sid)
 
 
+# Pairing abuse limits (spec §6.2-§6.4, §10).
+AUTHORIZE_PER_MINUTE = 60
+MAX_PENDING_PER_TENANT = 1000
+MAX_SLOW_DOWNS = 10
+FAILURES_PER_MINUTE = 10
+INITIAL_INTERVAL = 2
+
+
+class JtiCache:
+    """Remembers proof/assertion jtis until they expire. Expired entries
+    leave from the top of a min-heap ordered by expiry (O(log n) per call),
+    never by scanning the whole set."""
+
+    def __init__(self):
+        self.seen: dict[str, float] = {}
+        self.heap: list[tuple[float, str]] = []
+
+    def __len__(self):
+        return len(self.seen)
+
+    def _evict(self, now):
+        h = self.heap
+        while h and h[0][0] < now:
+            at, j = heapq.heappop(h)
+            if self.seen.get(j) == at:
+                del self.seen[j]
+
+    def has(self, j):
+        self._evict(time.time())
+        return j in self.seen
+
+    def use(self, j, until):
+        """Records j until `until` (epoch seconds); False if already recorded."""
+        self._evict(time.time())
+        if j in self.seen:
+            return False
+        self.seen[j] = until
+        heapq.heappush(self.heap, (until, j))
+        return True
+
+
+class WindowCounter:
+    """Counts events per key in fixed one-minute windows (the whole map is
+    dropped when the window rolls over)."""
+
+    def __init__(self):
+        self.start, self.n = 0.0, {}
+
+    def allow(self, key, limit):
+        now = time.time()
+        if now - self.start >= 60:
+            self.start, self.n = now, {}
+        c = self.n.get(key, 0)
+        if c >= limit:
+            return False
+        self.n[key] = c + 1
+        return True
+
+
 class Gateway:
     def __init__(self, issuer="", seed=None, max_conc=16, log=None, web_dir="", store: Store | None = None, **tuning):
-        self.cfg = {"issuer": L.origin(issuer) if issuer else "", "code_ttl": 600, "token_ttl": 900, "max_conc": max_conc,
+        # §18.1: the issuer is configuration, never derived from a request's Host.
+        if not issuer:
+            raise ValueError("lmbp: issuer is required (the gateway's public origin, e.g. https://gw.example.com)")
+        self.cfg = {"issuer": L.origin(issuer), "code_ttl": 600, "token_ttl": 900, "max_conc": max_conc,
                     "ping_interval": 20, "resume_window": 30, "task_timeout": 600, "slow_consumer": 60, "attach_grace": 30, "queue_timeout": 15,
                     "flow": dict(DEFAULT_FLOW)}
         self.cfg.update(tuning)
@@ -622,7 +715,10 @@ class Gateway:
         self.tenants = {}
         self.devs: dict[str, DState] = {}
         self.tasks: dict[str, Task] = {}
-        self.jtis, self.fails, self.pending = {}, {}, {}
+        self.jtis = JtiCache()
+        self.fails: dict[tuple[str, str], list[float]] = {}  # (tenant, end user) -> failure times (last minute)
+        self.pending: dict[str, dict[str, float]] = {}  # tenant -> device_code hash -> expiry
+        self.auth_rate = WindowCounter()
         # Retention (spec §14.4, errata E6): 7 days by default; 0/None keeps the default, negative disables.
         if not self.cfg.get("retention"):
             self.cfg["retention"] = RETENTION_DEFAULT
@@ -755,23 +851,11 @@ class Gateway:
                                                 "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
                                                 "Cache-Control": "no-cache"})
 
-    def issuer(self, req):
-        if self.cfg["issuer"]:
-            return self.cfg["issuer"]
-        scheme = "https" if req.secure else "http"
-        try:
-            return L.origin(f"{scheme}://{req.host}")
-        except ValueError:
-            return f"{scheme}://{req.host.lower()}"
+    def issuer(self, req):  # noqa: ARG002 - never derived from the request (§18.1)
+        return self.cfg["issuer"]
 
     def use_jti(self, j, until):
-        t = time.time()
-        for k in [k for k, v in self.jtis.items() if t > v]:
-            del self.jtis[k]
-        if j in self.jtis:
-            return False
-        self.jtis[j] = until
-        return True
+        return self.jtis.use(j, until)
 
     def verify_access(self, tok, iss):
         uc = L.unverified_claims(tok)
@@ -848,8 +932,11 @@ class Gateway:
     async def authorize(self, req):
         if req.method != "POST":
             return oauth_error(405, "invalid_request")
+        # §6.2: limited per client address (the TCP peer) before anything is parsed or stored.
+        if not self.auth_rate.allow(getattr(req, "peer", ""), AUTHORIZE_PER_MINUTE):
+            return oauth_error(429, "slow_down", {"Retry-After": "60"})
         ps = await params(req, 4096)
-        if not ps or not ps.get("tenant") or L.char_len(ps.get("device_name") or "") > 100:
+        if not ps or not ps.get("tenant") or ("device_name" in ps and not L.valid_device_name(ps["device_name"])):
             return oauth_error(400, "invalid_request")
         try:
             pub = L.unb64(ps.get("public_key", ""))
@@ -857,22 +944,67 @@ class Gateway:
             return oauth_error(400, "invalid_request")
         if len(pub) != 32:
             return oauth_error(400, "invalid_request")
+        if not L.TENANT_ID_RE.match(ps["tenant"]) or ps["tenant"] not in self.tenants:
+            return oauth_error(400, "invalid_client")
         dc = L.random_id("dc_")
         d = {"code_hash": L.sha_hex(dc), "user_code": user_code(), "tenant": ps["tenant"], "pub": pub, "name": ps.get("device_name", ""),
-             "status": "pending", "expires": time.time() + self.cfg["code_ttl"], "interval": 2, "last_poll": 0.0, "device_id": "", "owner": ""}
-        self.store.put_device_auth(d)
-        self.pending[d["code_hash"]] = d
+             "status": "pending", "expires": time.time() + self.cfg["code_ttl"], "interval": INITIAL_INTERVAL, "last_poll": 0.0, "device_id": "", "owner": ""}
+        if not self.reserve_pending(d["tenant"], d["code_hash"], d["expires"]):
+            return oauth_error(429, "slow_down", {"Retry-After": "60"})
+        try:
+            self.store.put_device_auth(d)
+        except Exception:
+            self.release_pending(d["tenant"], d["code_hash"])
+            raise
         return json_resp(200, {"device_code": dc, "user_code": d["user_code"], "expires_in": self.cfg["code_ttl"], "interval": d["interval"]},
                          {"Cache-Control": "no-store"})
 
-    def allow_attempt(self, tenant):
-        cut = time.time() - 60
-        keep = [t for t in self.fails.get(tenant, []) if t > cut]
-        self.fails[tenant] = keep
-        return len(keep) < 10
+    def reserve_pending(self, tenant, h, expires):
+        """Count a new pending pairing against its tenant's cap (expired entries are dropped first)."""
+        now = time.time()
+        m = self.pending.setdefault(tenant, {})
+        for k in [k for k, at in m.items() if now > at]:
+            del m[k]
+        if len(m) >= MAX_PENDING_PER_TENANT:
+            return False
+        m[h] = expires
+        return True
 
-    def record_failure(self, tenant):
-        self.fails.setdefault(tenant, []).append(time.time())
+    def release_pending(self, tenant, h):
+        m = self.pending.get(tenant)
+        if m is not None:
+            m.pop(h, None)
+            if not m:
+                del self.pending[tenant]
+
+    # Failures are counted per end user of a tenant (§6.4). Decisions run
+    # synchronously on the event loop (no await between the check, the
+    # decision and the record), so they are atomic: a code is decided once.
+    def allow_attempt(self, tenant, user):
+        cut = time.time() - 60
+        keep = [t for t in self.fails.get((tenant, user), []) if t > cut]
+        if keep:
+            self.fails[(tenant, user)] = keep
+        else:
+            self.fails.pop((tenant, user), None)
+        return len(keep) < FAILURES_PER_MINUTE
+
+    def record_failure(self, tenant, user):
+        self.fails.setdefault((tenant, user), []).append(time.time())
+
+    def pair_lookup(self, tenant, owner, user_code):
+        """The pending pairing for a code the end user typed (to show the
+        device before deciding). A code that is not pending counts as a
+        failure of that user, like a failed decision. Returns (d, None) or
+        (None, (status, code, message))."""
+        if not self.allow_attempt(tenant, owner):
+            return None, (429, "RATE_LIMITED", "too many failed codes; wait a minute")
+        code = norm_code(user_code)
+        d = self.store.device_auth_by_user_code(tenant, code) if code else None
+        if d is None or d["status"] != "pending" or time.time() > d["expires"]:
+            self.record_failure(tenant, owner)
+            return None, (404, "BAD_REQUEST", "code invalid, expired or already used")
+        return d, None
 
     async def approve(self, req):
         err = self.err_for(req)
@@ -899,11 +1031,11 @@ class Gateway:
         handler and in-process SDK API alike): enforces the per-tenant
         failed-code lockout and counts every failure. Returns (d, None) or
         (None, (status, code, message))."""
-        if not self.allow_attempt(tenant):
+        if not self.allow_attempt(tenant, owner):
             return None, (429, "RATE_LIMITED", "too many failed codes; wait a minute")
 
         def fail(*e):
-            self.record_failure(tenant)
+            self.record_failure(tenant, owner)
             return None, e
         code = norm_code(user_code)
         d = self.store.device_auth_by_user_code(tenant, code) if code else None
@@ -925,7 +1057,7 @@ class Gateway:
             self.store.put_device({"id": d["device_id"], "tenant": tenant, "owner": owner, "name": d["name"], "pub": d["pub"],
                                    "status": "active", "created": datetime.datetime.now(datetime.timezone.utc), "e2ee_key": ""})
         self.store.put_device_auth(d)
-        self.pending.pop(d["code_hash"], None)
+        self.release_pending(tenant, d["code_hash"])
         return d
 
     def issue(self, dev, iss):
@@ -949,15 +1081,18 @@ class Gateway:
                 return oauth_error(400, "invalid_grant")
             try:
                 pc = L.verify_proof(d["pub"], ps.get("proof"), "", L.PROOF_TOKEN, ps["device_code"])
-                if not self.use_jti(pc["jti"], time.time() + 180):
+                if self.jtis.has(pc["jti"]):
                     raise ValueError("replay")
             except (ValueError, TypeError, KeyError):
                 return oauth_error(400, "invalid_grant")
+            # A code that can no longer yield a token answers without remembering the proof's jti.
             if time.time() > d["expires"]:
                 return oauth_error(400, "expired_token")
             if d["status"] == "denied":
                 return oauth_error(400, "access_denied")
             if d["status"] == "consumed":
+                return oauth_error(400, "invalid_grant")
+            if not self.use_jti(pc["jti"], time.time() + 180):
                 return oauth_error(400, "invalid_grant")
             if d["status"] == "pending":
                 t = time.time()
@@ -965,8 +1100,13 @@ class Gateway:
                 d["last_poll"] = t
                 if slow:
                     d["interval"] += 5
+                # §6.3: a device that keeps ignoring slow_down loses its code.
+                dead = (d["interval"] - INITIAL_INTERVAL) // 5 > MAX_SLOW_DOWNS
+                if dead:
+                    d["expires"] = t
+                    self.release_pending(d["tenant"], d["code_hash"])
                 self.store.put_device_auth(d)
-                return oauth_error(400, "slow_down" if slow else "authorization_pending")
+                return oauth_error(400, "expired_token" if dead else "slow_down" if slow else "authorization_pending")
             dev = self.store.get_device(d["device_id"])
             if dev is None:
                 return oauth_error(500, "server_error")
@@ -1008,17 +1148,8 @@ class Gateway:
                 if s.model_names:
                     item["model_names"] = dict(s.model_names)
             out.append(item)
-        now = time.time()
-        pend = []
-        for h in list(self.pending):
-            d = self.store.get_device_auth(h)
-            if d is None or d["status"] != "pending" or now > d["expires"]:
-                self.pending.pop(h, None)
-                continue
-            if d["tenant"] == t["id"]:
-                exp = datetime.datetime.fromtimestamp(int(d["expires"]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                pend.append({"device_name": d["name"], "jkt": L.thumbprint(d["pub"]), "expires_at": exp})
-        return json_resp(200, {"devices": out, "pending_pairings": pend})
+        # Pending pairings are never listed (§6.4, §12.6): approval needs the code shown on the device.
+        return json_resp(200, {"devices": out})
 
     async def revoke(self, req):
         err = self.err_for(req)
@@ -1039,7 +1170,7 @@ class Gateway:
             return False
         d["status"] = "revoked"
         self.store.put_device(d)
-        self.drop_device(id, "UNAUTHENTICATED", "device revoked")
+        self.drop_device(id, "DEVICE_OFFLINE", "device revoked")  # in-flight tasks: OUTCOME_UNKNOWN (§7.5)
         return True
 
     def drop_device(self, id, code, msg):

@@ -39,7 +39,7 @@ class ConsistencyTest {
   }
 
   void start(Store store, long retentionMs) throws Exception {
-    LMBPServer.Builder b = LMBPServer.builder().tenant("acme", KEY, Map.of("display_name", "Acme")).store(store).logger(s -> { });
+    LMBPServer.Builder b = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", KEY, Map.of("display_name", "Acme")).store(store).logger(s -> { });
     if (retentionMs != 0) b.retentionMillis(retentionMs);
     lmbp = b.build();
     srv = StandaloneServer.start(lmbp, "127.0.0.1", 0);
@@ -91,7 +91,7 @@ class ConsistencyTest {
     assertEquals(7L * 24 * 3600_000, Gateway.RETENTION_DEFAULT);
     assertEquals(3600_000, Gateway.retentionEvery(Gateway.RETENTION_DEFAULT));
     assertEquals(1000, Gateway.retentionEvery(1500));
-    try (LMBPServer off = LMBPServer.builder().tenant("acme", KEY).retentionMillis(-1).logger(s -> { }).build()) {
+    try (LMBPServer off = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", KEY).retentionMillis(-1).logger(s -> { }).build()) {
       assertNull(off.g.retentionTimer, "negative retention still schedules purges");
     }
     MemoryStore store = new MemoryStore();

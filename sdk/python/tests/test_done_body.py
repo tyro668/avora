@@ -10,6 +10,7 @@ import httpx
 from lmbp_server import LMBPServer, MemoryStore, TenantConfig
 from lmbp_server import protocol as L
 from simdevice import pair_and_connect
+from conftest import issuer
 
 KEY = "k" * 40
 CASES = [
@@ -21,7 +22,7 @@ CASES = [
 
 async def test_invalid_terminal_body_not_accepted(serve_app):
     store = MemoryStore()
-    lmbp = LMBPServer([TenantConfig("acme", KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig("acme", KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None)
     st = {"bad": None, "last": "", "acks": {}}
 
     def manual(run, ws, listeners):

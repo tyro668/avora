@@ -7,15 +7,17 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const within = (p, ms, what) => Promise.race([p, new Promise((_, bad) => setTimeout(() => bad(new Error('timed out: ' + what)), ms))]);
 
 async function rig() {
-  const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   const runs = [];
   const d = await pairAndConnect(lmbp, base, 'acme', 'u1', { manual: (run) => runs.push(run.task_id) }); // silent model

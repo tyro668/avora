@@ -35,7 +35,7 @@ TENANT_API_KEY=$(openssl rand -hex 24) java -jar ../../examples/spring-boot-demo
 ```
 
 ```properties
-lmbp.issuer=https://saas.example.com      # 公网 origin；留空为开发模式（以请求的 Host 为准，不要用于生产）
+lmbp.issuer=https://saas.example.com      # 必填：网关公网 origin；为空时启动失败，绝不从请求 Host 推导
 lmbp.tenant=acme
 lmbp.api-key=${TENANT_API_KEY}            # ≥ 32 字符，服务端密钥
 lmbp.signing-seed=${LMBP_SIGNING_SEED:}   # 可选，32 字节 hex；留空则首次启动生成并保存在 store 中
@@ -60,7 +60,7 @@ lmbp.store=jdbc:sqlite:lmbp.db            # memory（默认）| jdbc（使用应
 
 Starter 注册的路由：`/.well-known/lmbp`、`/.well-known/jwks.json`、`/lmbp/**`、`/v1/**`、`/healthz`（在 Spring MVC 之前由过滤器处理；应用自己不要再占用 `/v1/**`），以及 WebSocket `/lmbp/v1/connect`（子协议 `lmbp`，单条消息上限 256 KiB）。任何 Bean 都可以用自己的同类型 Bean 覆盖。
 
-`LmbpClient`：`pairLink(userId)`、`lookup(code)`、`approve(userId, code)`、`deny`、`devices(userId)`、`revoke`、`models(userId)`、`chat([userId,] req)`、`stream([userId,] req) → SseEmitter`、`cancel(userId, taskId)`、`resume(userId, taskId, lastEventId) → SseEmitter`、`forUser(userId) → InProcessClient`。不带 `userId` 的方法通过 `LmbpUserResolver` 解析当前请求的用户。`stream` 每个 OpenAI chunk 发一个 `data:` 事件（事件 id 是续传游标），最后发 `data: [DONE]`；失败时改发 `event: error`（`{"code","message","task_id","last_event_id"}`）。浏览器断开或超时会取消任务。
+`LmbpClient`：`pairLink(userId)`、`lookup(userId, code)`、`approve(userId, code)`、`deny`、`devices(userId)`、`revoke`、`models(userId)`、`chat([userId,] req)`、`stream([userId,] req) → SseEmitter`、`cancel(userId, taskId)`、`resume(userId, taskId, lastEventId) → SseEmitter`、`forUser(userId) → InProcessClient`。不带 `userId` 的方法通过 `LmbpUserResolver` 解析当前请求的用户。`stream` 每个 OpenAI chunk 发一个 `data:` 事件（事件 id 是续传游标），最后发 `data: [DONE]`；失败时改发 `event: error`（`{"code","message","task_id","last_event_id"}`）。浏览器断开或超时会取消任务。
 
 ## 不用 Spring：`lmbp-core`
 
@@ -87,7 +87,7 @@ c.cancel(taskId);  c.resume(taskId, lastEventId);
 | 构造 | `LMBPServer.builder()`：`issuer`、`tenant(id, apiKey[, profile])`、`store`、`signingSeed` / `signingSeedHex`、`maxConcurrency`、`taskTimeoutMillis`、`keepaliveMillis`、`chatUiDir`、`logger`；`close()` |
 | 接入 Web 框架 | `handles(path)`、`handle(HttpRequest, HttpSink)`（阻塞到响应结束；客户端断开时调用 `HttpRequest.abort()`）、`handshake(HttpRequest) → WebSocketHandshake`（被拒时返回状态码与 problem 正文；通过时 `accept(WebSocketPeer) → WebSocketSession`，传输层把收到的消息交给它） |
 | 密钥 | `kid()`、`jwks()`、`LMBPServer.generateSigningSeed()`、`generateTenantKey()` |
-| 配对 | `pairing().link(tenant[, issuer])`、`lookup`、`approve(tenant, user, code[, jkt])`、`deny`、`listDevices`、`revokeDevice`；失败抛 `PairingException`（`code`：`BAD_REQUEST` / `NOT_FOUND` / `FORBIDDEN` / `CONSENT_DENIED` / `RATE_LIMITED`） |
+| 配对 | `pairing().link(tenant)`、`lookup(tenant, user, code)`（错误码按最终用户计入每分钟 10 次的上限）、`approve(tenant, user, code[, jkt])`、`deny`、`listDevices`、`revokeDevice`；失败抛 `PairingException`（`code`：`BAD_REQUEST` / `NOT_FOUND` / `FORBIDDEN` / `CONSENT_DENIED` / `RATE_LIMITED`） |
 | 进程内客户端 | `client(tenant, user)`：`models()`、`call`、`stream`、`messages`、`messagesStream`、`resume`、`cancel`；`Options.idempotent(key)` |
 | 存储 | `Store` 接口；`MemoryStore`、`JdbcStore(DataSource[, textType])`、`JdbcStore.open(url)` |
 

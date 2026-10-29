@@ -206,8 +206,14 @@ func (t *gtask) onDeviceFrame(in lmbp.Envelope) {
 		t.seen = in.Seq
 	}
 	data := in.Data
-	if in.Type == lmbp.TypeTaskDelta && !t.e2ee {
-		if why := t.checkDeltaLocked(data); why != "" {
+	if in.Type == lmbp.TypeTaskDelta {
+		why := ""
+		if t.e2ee {
+			why = t.checkSealedLocked(data)
+		} else {
+			why = t.checkDeltaLocked(data)
+		}
+		if why != "" {
 			t.mu.Unlock()
 			t.g.cfg.Logger.Printf("lmbp: task %s: %s", t.id, why)
 			t.abort("protocol_error", lmbp.ErrInternal, "device sent an invalid delta: "+why)
@@ -412,11 +418,18 @@ func (t *gtask) commitLocal(code, msg string, retryable bool) {
 	t.finishWith(state, false, false)
 }
 
-// failOffline ends a task whose device is gone: DEVICE_OFFLINE is retryable
-// only if task.run was never written (at-most-once execution).
+// failOffline ends a task whose device session is gone, whatever ended it
+// (disconnect, revocation, replacement): once task.run was written the
+// device may have run it, so the outcome is OUTCOME_UNKNOWN (§7.5); before
+// that, DEVICE_OFFLINE, which is retryable (at-most-once execution).
 func (t *gtask) failOffline(code, msg string) {
-	if code == lmbp.ErrDeviceOffline && t.sentRun.Load() {
-		code, msg = lmbp.ErrOutcomeUnknown, msg+"; outcome unknown"
+	if t.sentRun.Load() {
+		if code != lmbp.ErrOutcomeUnknown {
+			msg += "; outcome unknown"
+		}
+		code = lmbp.ErrOutcomeUnknown
+	} else {
+		code = lmbp.ErrDeviceOffline
 	}
 	t.failLocal(code, msg, code == lmbp.ErrDeviceOffline)
 }
@@ -590,29 +603,33 @@ func (t *gtask) stream(ctx context.Context, after int64, keepalive func() error,
 	}
 }
 
-// Bounds on what non-streaming aggregation builds from device deltas.
-const (
-	maxToolCalls     = 128      // tool-call indexes 0..127
-	maxAggregateSize = 64 << 20 // text + tool names/arguments per task
-)
-
 // checkDeltaLocked validates a device delta before it is stored or
-// aggregated: tool-call index range and the task's total output size.
+// aggregated: tool-call index range (§16.1) and the task's output budget.
 func (t *gtask) checkDeltaLocked(data []byte) string {
 	var d lmbp.TaskDelta
 	if json.Unmarshal(data, &d) != nil {
 		return "malformed task.delta"
 	}
-	n := len(d.Text)
 	for _, c := range d.ToolCalls {
-		if c.Index != nil && (*c.Index < 0 || *c.Index >= maxToolCalls) {
-			return fmt.Sprintf("tool call index %d out of range [0,%d)", *c.Index, maxToolCalls)
+		if c.Index != nil && (*c.Index < 0 || *c.Index > lmbp.MaxToolCallIndex) {
+			return fmt.Sprintf("tool call index %d out of range [0,%d]", *c.Index, lmbp.MaxToolCallIndex)
 		}
-		n += len(c.Function.Name) + len(c.Function.Arguments) + len(c.ID)
 	}
+	return t.chargeLocked(len(data))
+}
+
+// checkSealedLocked bounds what an end-to-end encrypted task buffers: the
+// gateway cannot read sealed deltas, so they are charged like cleartext.
+func (t *gtask) checkSealedLocked(data []byte) string { return t.chargeLocked(len(data)) }
+
+// chargeLocked adds an encoded task.delta body to the task's output budget
+// (§10: MaxTaskOutputBytes per task, cleartext and sealed alike). Every
+// delta is buffered for replay and aggregation, so the budget is what bounds
+// a task's memory.
+func (t *gtask) chargeLocked(n int) string {
 	t.aggBytes += n
-	if t.aggBytes > maxAggregateSize {
-		return "task output exceeds the aggregate size limit"
+	if t.aggBytes > lmbp.MaxTaskOutputBytes {
+		return "task output exceeds the per-task limit"
 	}
 	return ""
 }

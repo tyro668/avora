@@ -66,9 +66,11 @@ type Gateway struct {
 	mu        sync.Mutex
 	devs      map[string]*dstate // device_id → live or resumable device session
 	tasks     map[string]*gtask  // task_id → task (kept AttachGrace+10m after completion)
-	jtis      map[string]time.Time
-	fail      map[string][]time.Time // tenant → recent failed approvals
-	pending   map[string]store.DeviceAuth
+	jtis      *jtiCache
+	pairMu    sync.Mutex                      // serializes pairing decisions (single use, failure counting)
+	fail      map[string][]time.Time          // tenant + end user → recent failed decisions (under pairMu)
+	pending   map[string]map[string]time.Time // tenant → device_code hash → expiry (under mu)
+	authRate  windowCounter                   // device authorizations per client address
 	refreshes atomic.Int64
 	resumes   atomic.Int64
 }
@@ -134,7 +136,7 @@ func New(cfg Config) (*Gateway, error) {
 		cfg.Issuer = o
 	}
 	pub := cfg.SigningKey.Public().(ed25519.PublicKey)
-	g := &Gateway{cfg: cfg, pub: pub, kid: lmbp.Thumbprint(pub), devs: map[string]*dstate{}, tasks: map[string]*gtask{}, jtis: map[string]time.Time{}, fail: map[string][]time.Time{}, pending: map[string]store.DeviceAuth{}}
+	g := &Gateway{cfg: cfg, pub: pub, kid: lmbp.Thumbprint(pub), devs: map[string]*dstate{}, tasks: map[string]*gtask{}, jtis: newJTICache(), fail: map[string][]time.Time{}, pending: map[string]map[string]time.Time{}}
 	g.recoverOrphans(context.Background())
 	return g, nil
 }
@@ -251,6 +253,9 @@ func (g *Gateway) Handler() http.Handler {
 	m.HandleFunc("/v1/chat/completions", g.chat)
 	if !g.cfg.CoreOnly {
 		m.HandleFunc("/v1/messages", g.messages)
+	}
+	if g.cfg.Issuer == "" {
+		return loopbackOnly(m)
 	}
 	return m
 }
@@ -404,9 +409,15 @@ func (g *Gateway) authorize(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 405, "invalid_request")
 		return
 	}
+	// §6.2: limited per client address before anything is parsed or stored.
+	if !g.authRate.allow(clientAddr(r), AuthorizePerMinute, time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		oauthError(w, 429, "slow_down")
+		return
+	}
 	ps, err := params(r, 4096)
 	req := struct{ Tenant, PublicKey, DeviceName string }{ps["tenant"], ps["public_key"], ps["device_name"]}
-	if err != nil || req.Tenant == "" || lmbp.CharLen(req.DeviceName) > 100 /* code points, §4.1 */ {
+	if err != nil || req.Tenant == "" || !lmbp.ValidDeviceName(req.DeviceName) {
 		oauthError(w, 400, "invalid_request")
 		return
 	}
@@ -415,16 +426,27 @@ func (g *Gateway) authorize(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 400, "invalid_request")
 		return
 	}
+	if !lmbp.TenantIDPattern.MatchString(req.Tenant) {
+		oauthError(w, 400, "invalid_client")
+		return
+	}
+	if _, err := g.cfg.Store.GetTenant(r.Context(), req.Tenant); err != nil {
+		oauthError(w, 400, "invalid_client") // §6.2: only registered tenants get pairings
+		return
+	}
 	dc := lmbp.RandomID("dc_")
 	d := store.DeviceAuth{DeviceCodeHash: sha(dc), UserCode: userCode(), TenantID: req.Tenant, PublicKey: pub, DeviceName: req.DeviceName,
-		Status: "pending", ExpiresAt: time.Now().Add(g.cfg.CodeTTL), Interval: 2}
+		Status: "pending", ExpiresAt: time.Now().Add(g.cfg.CodeTTL), Interval: initialInterval}
+	if !g.reservePending(d.TenantID, d.DeviceCodeHash, d.ExpiresAt) {
+		w.Header().Set("Retry-After", "60")
+		oauthError(w, 429, "slow_down")
+		return
+	}
 	if err := g.cfg.Store.CreateDeviceAuth(r.Context(), d); err != nil {
+		g.releasePending(d.TenantID, d.DeviceCodeHash)
 		oauthError(w, 500, "server_error")
 		return
 	}
-	g.mu.Lock()
-	g.pending[d.DeviceCodeHash] = d
-	g.mu.Unlock()
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, map[string]any{"device_code": dc, "user_code": d.UserCode, "expires_in": int(g.cfg.CodeTTL.Seconds()), "interval": d.Interval})
 }
@@ -469,24 +491,66 @@ func (g *Gateway) approve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": d.Status, "device_id": d.DeviceID, "device_name": d.DeviceName, "jkt": lmbp.Thumbprint(d.PublicKey)})
 }
 
-func (g *Gateway) allowAttempt(tenant string) bool {
+// reservePending counts a new pending pairing against its tenant's cap
+// (MaxPendingPerTenant live codes); expired entries are dropped first.
+func (g *Gateway) reservePending(tenant, hash string, exp time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	now := time.Now()
+	m := g.pending[tenant]
+	if m == nil {
+		m = map[string]time.Time{}
+		g.pending[tenant] = m
+	}
+	for h, at := range m {
+		if now.After(at) {
+			delete(m, h)
+		}
+	}
+	if len(m) >= MaxPendingPerTenant {
+		return false
+	}
+	m[hash] = exp
+	return true
+}
+
+// releasePending forgets a pairing that is no longer pending.
+func (g *Gateway) releasePending(tenant, hash string) {
+	g.mu.Lock()
+	if m := g.pending[tenant]; m != nil {
+		delete(m, hash)
+		if len(m) == 0 {
+			delete(g.pending, tenant)
+		}
+	}
+	g.mu.Unlock()
+}
+
+// failKey scopes decision failures to one end user of one tenant (§6.4).
+func failKey(tenant, user string) string { return tenant + "\x00" + user }
+
+// allowAttemptLocked reports whether the end user may make another pairing
+// decision. Called with pairMu held, so the check and the failure that may
+// follow are one atomic step: concurrent requests cannot all pass the check
+// before any failure is recorded.
+func (g *Gateway) allowAttemptLocked(key string) bool {
 	cut := time.Now().Add(-time.Minute)
-	keep := g.fail[tenant][:0]
-	for _, t := range g.fail[tenant] {
+	keep := g.fail[key][:0]
+	for _, t := range g.fail[key] {
 		if t.After(cut) {
 			keep = append(keep, t)
 		}
 	}
-	g.fail[tenant] = keep
-	return len(keep) < 10
+	if len(keep) == 0 {
+		delete(g.fail, key)
+	} else {
+		g.fail[key] = keep
+	}
+	return len(keep) < FailuresPerMinute
 }
 
-func (g *Gateway) recordFailure(tenant string) {
-	g.mu.Lock()
-	g.fail[tenant] = append(g.fail[tenant], time.Now())
-	g.mu.Unlock()
+func (g *Gateway) recordFailureLocked(key string) {
+	g.fail[key] = append(g.fail[key], time.Now())
 }
 
 func (g *Gateway) issue(d store.Device, iss string) map[string]any {
@@ -517,10 +581,13 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 			oauthError(w, 400, "invalid_grant")
 			return
 		}
-		if pc, err := lmbp.VerifyProof(d.PublicKey, req.Proof, "", lmbp.ProofToken, req.DeviceCode, time.Now()); err != nil || !g.useJTI(pc.Jti, time.Now().Add(3*time.Minute)) {
+		pc, err := lmbp.VerifyProof(d.PublicKey, req.Proof, "", lmbp.ProofToken, req.DeviceCode, time.Now())
+		if err != nil || g.jtis.Seen(pc.Jti) {
 			oauthError(w, 400, "invalid_grant")
 			return
 		}
+		// A code that can no longer yield a token answers without remembering
+		// the proof's jti: polling a dead code costs the gateway nothing.
 		if time.Now().After(d.ExpiresAt) {
 			oauthError(w, 400, "expired_token")
 			return
@@ -532,17 +599,31 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 		case "consumed":
 			oauthError(w, 400, "invalid_grant")
 			return
-		case "pending":
+		}
+		if !g.jtis.Use(pc.Jti, time.Now().Add(3*time.Minute)) {
+			oauthError(w, 400, "invalid_grant")
+			return
+		}
+		if d.Status == "pending" {
 			now := time.Now()
 			slow := now.Sub(d.LastPoll) < time.Duration(d.Interval)*time.Second-200*time.Millisecond
 			d.LastPoll = now
 			if slow {
 				d.Interval += 5
 			}
+			// §6.3: a device that keeps ignoring slow_down loses its code.
+			dead := (d.Interval-initialInterval)/5 > MaxSlowDowns
+			if dead {
+				d.ExpiresAt = now
+				g.releasePending(d.TenantID, d.DeviceCodeHash)
+			}
 			_ = g.cfg.Store.UpdateDeviceAuth(ctx, d)
-			if slow {
+			switch {
+			case dead:
+				oauthError(w, 400, "expired_token")
+			case slow:
 				oauthError(w, 400, "slow_down")
-			} else {
+			default:
 				oauthError(w, 400, "authorization_pending")
 			}
 			return
@@ -572,7 +653,7 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c, err := lmbp.VerifyJWT(dev.PublicKey, req.Assertion, lmbp.TypAssertion, lmbp.AssertionAudience(g.issuer(r)), time.Now())
-		if err != nil || c.Iss != dev.ID || c.Exp-c.Iat > 300 || c.Jti == "" || !g.useJTI(c.Jti, time.Unix(c.Exp+60, 0)) {
+		if err != nil || c.Iss != dev.ID || c.Exp-c.Iat > 300 || c.Jti == "" || !g.jtis.Use(c.Jti, time.Unix(c.Exp+60, 0)) {
 			oauthError(w, 400, "invalid_grant")
 			return
 		}
@@ -580,22 +661,6 @@ func (g *Gateway) token(w http.ResponseWriter, r *http.Request) {
 	default:
 		oauthError(w, 400, "unsupported_grant_type")
 	}
-}
-
-func (g *Gateway) useJTI(j string, until time.Time) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	now := time.Now()
-	for k, v := range g.jtis {
-		if now.After(v) {
-			delete(g.jtis, k)
-		}
-	}
-	if _, seen := g.jtis[j]; seen {
-		return false
-	}
-	g.jtis[j] = until
-	return true
 }
 
 // ---------- tenant device management ----------
@@ -637,39 +702,7 @@ func (g *Gateway) listDevices(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, item)
 	}
-	writeJSON(w, 200, map[string]any{"devices": out, "pending_pairings": g.pendingPairings(r.Context(), t.ID)})
-}
-
-func (g *Gateway) pendingPairings(ctx context.Context, tenantID string) []map[string]any {
-	now := time.Now()
-	g.mu.Lock()
-	var cand []store.DeviceAuth
-	for h, d := range g.pending {
-		if now.After(d.ExpiresAt) {
-			delete(g.pending, h)
-			continue
-		}
-		if d.TenantID == tenantID {
-			cand = append(cand, d)
-		}
-	}
-	g.mu.Unlock()
-	out := []map[string]any{}
-	for _, c := range cand {
-		d, err := g.cfg.Store.DeviceAuthByCodeHash(ctx, c.DeviceCodeHash)
-		if err != nil || d.Status != "pending" || now.After(d.ExpiresAt) {
-			g.mu.Lock()
-			delete(g.pending, c.DeviceCodeHash)
-			g.mu.Unlock()
-			continue
-		}
-		out = append(out, map[string]any{
-			"device_name": d.DeviceName,
-			"jkt":         lmbp.Thumbprint(d.PublicKey),
-			"expires_at":  d.ExpiresAt.UTC().Format(time.RFC3339),
-		})
-	}
-	return out
+	writeJSON(w, 200, map[string]any{"devices": out})
 }
 
 func (g *Gateway) revoke(w http.ResponseWriter, r *http.Request) {

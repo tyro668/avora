@@ -373,6 +373,24 @@ func (r *runner) runExt(ctx context.Context, key ed25519.PrivateKey, at string) 
 		}
 		s2, _, b2 := r.chatRaw(ctx, map[string]any{"model": full(mPlain), "tools": tools, "messages": []any{map[string]any{"role": "user", "content": "x"}}}, nil)
 		r.check("X-T4", "tools sent to a model without the tools capability fail with 400 CAPABILITY_UNSUPPORTED", want(s2 == 400 && errCode(b2) == lmbp.ErrUnsupported, "status %d %s", s2, b2))
+		// X-T5: an out-of-range tool_calls index fails the task
+		tc5 := call(map[string]any{"model": full(mTools), "tools": tools, "messages": []any{map[string]any{"role": "user", "content": "index?"}}}, nil)
+		f5, _, err5 := dev.await(lmbp.TypeTaskRun, nil)
+		reason := ""
+		if err5 == nil {
+			idx := lmbp.MaxToolCallIndex + 1
+			_ = dev.send(lmbp.TypeTaskDelta, f5.TaskID, 1, lmbp.TaskDelta{ToolCalls: []lmbp.ToolCall{{Index: &idx, ID: "call_x", Type: "function", Function: lmbp.FunctionCall{Name: "get_weather", Arguments: "{}"}}}})
+			cf, _, cerr := dev.await(lmbp.TypeTaskCancel, func(e lmbp.Envelope) bool { return e.TaskID == f5.TaskID })
+			if cerr == nil {
+				var c lmbp.TaskCancel
+				_ = json.Unmarshal(cf.Data, &c)
+				reason = c.Reason
+			}
+			_ = dev.send(lmbp.TypeTaskError, f5.TaskID, 2, lmbp.ErrorBody{Code: lmbp.ErrCancelled, Message: "cancelled"})
+		}
+		rs5 := <-tc5
+		r.check("X-T5", "a device tool_calls index of 128 (outside 0..127) fails the task: task.cancel(protocol_error) to the device, 502 INTERNAL to the caller (§10, §16.1)",
+			want(err5 == nil && reason == "protocol_error" && rs5.st == 502 && errCode(rs5.body) == lmbp.ErrInternal, "err %v cancel %q status %d body %s", err5, reason, rs5.st, rs5.body))
 	}
 	if r.runs(lmbp.ProfileAnthropic, "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10") {
 		r.runAnthropic(ctx, dev, full, mTools)

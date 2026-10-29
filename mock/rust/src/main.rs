@@ -93,6 +93,7 @@ fn main() {
         }
         web_dir = guess.to_string_lossy().into_owned();
     }
+    let issuer = if issuer.is_empty() { loopback_issuer(&listen) } else { issuer };
     let mut cfg = gateway::Config { issuer, max_conc, web_dir: if no_chat { String::new() } else { web_dir }, ..Default::default() };
     if retention != 0 {
         cfg.retention = retention;
@@ -126,10 +127,19 @@ fn main() {
     if n == 0 {
         eprintln!("warning: no tenants registered (use --tenant id:ENV_VAR)");
     }
-    let iss = if g.cfg.issuer.is_empty() { "(request origin, dev mode)".to_string() } else { g.cfg.issuer.clone() };
+    let iss = g.cfg.issuer.clone();
     drop(g);
     let addr = if listen.starts_with(':') { format!("0.0.0.0{}", listen) } else { listen.clone() };
     let l = TcpListener::bind(&addr).unwrap_or_else(|e| die(&format!("listen {}: {}", listen, e)));
     eprintln!("lmbp rust mock gateway listening on {} issuer={} kid={}", listen, iss, kid);
     http::serve(l);
+}
+
+/// The default issuer for a loopback --listen address; any other address needs --issuer (spec §18.1).
+fn loopback_issuer(listen: &str) -> String {
+    let h = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen).trim_start_matches('[').trim_end_matches(']');
+    if h == "localhost" || h == "::1" || h.starts_with("127.") {
+        return format!("http://{}", listen);
+    }
+    die(&format!("--issuer (or LMBP_ISSUER) is required when listening on {}", listen))
 }

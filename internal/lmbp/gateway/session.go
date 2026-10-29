@@ -301,7 +301,7 @@ func (g *Gateway) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pc, perr := lmbp.VerifyProof(dev.PublicKey, hello.Proof, dev.ID, lmbp.ProofHello, tok, time.Now())
-	if hello.DeviceID != dev.ID || perr != nil || !g.useJTI(pc.Jti, time.Now().Add(3*time.Minute)) {
+	if hello.DeviceID != dev.ID || perr != nil || !g.jtis.Use(pc.Jti, time.Now().Add(3*time.Minute)) {
 		early(lmbp.ErrUnauthenticated, "invalid key proof")
 		return
 	}
@@ -726,7 +726,7 @@ func (g *Gateway) refreshSession(ctx context.Context, ds *dstate, dev store.Devi
 		return false
 	}
 	pc, err := lmbp.VerifyProof(dev.PublicKey, st.Proof, dev.ID, lmbp.ProofSessionToken, st.AccessToken, time.Now())
-	if err != nil || !g.useJTI(pc.Jti, time.Now().Add(3*time.Minute)) {
+	if err != nil || !g.jtis.Use(pc.Jti, time.Now().Add(3*time.Minute)) {
 		return false
 	}
 	ds.mu.Lock()

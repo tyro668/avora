@@ -12,9 +12,20 @@ def free_port():
         return s.getsockname()[1]
 
 
+_last_port = None
+
+
+def issuer():
+    """A loopback issuer for a gateway under test; the next serve() listens on its port
+    (the issuer is configuration and must be known before the server starts)."""
+    global _last_port
+    _last_port = free_port()
+    return f"http://127.0.0.1:{_last_port}"
+
+
 @contextlib.asynccontextmanager
-async def serve(app):
-    port = free_port()
+async def serve(app, port=None):
+    port = port or _last_port or free_port()
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", ws="websockets", lifespan="off"))
     task = asyncio.ensure_future(srv.serve())
     while not srv.started:

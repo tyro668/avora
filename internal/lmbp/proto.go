@@ -100,6 +100,31 @@ func ValidModelID(s string) error {
 // Unicode code points, the same unit as JSON Schema maxLength.
 func CharLen(s string) int { return utf8.RuneCountInString(s) }
 
+// MaxDeviceNameChars bounds device_name in code points (spec §6.2).
+const MaxDeviceNameChars = 100
+
+// ValidDeviceName reports whether a device-reported name is acceptable
+// (spec §6.2): valid UTF-8, at most 100 code points, and none of the
+// characters that can disguise text: C0/C1 controls (U+0000-U+001F,
+// U+007F-U+009F), soft hyphen U+00AD, U+061C, U+180E, zero-width and
+// directional marks U+200B-U+200F, line/paragraph separators and embedding
+// controls U+2028-U+202E, U+2060-U+206F, U+FEFF and U+FFF9-U+FFFB.
+// The name is still untrusted text chosen by the device.
+func ValidDeviceName(s string) bool {
+	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > MaxDeviceNameChars {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r <= 0x1F, r >= 0x7F && r <= 0x9F, r == 0xAD, r == 0x61C, r == 0x180E,
+			r >= 0x200B && r <= 0x200F, r >= 0x2028 && r <= 0x202E, r >= 0x2060 && r <= 0x206F,
+			r == 0xFEFF, r >= 0xFFF9 && r <= 0xFFFB:
+			return false
+		}
+	}
+	return true
+}
+
 // ValidHeaderValue reports whether s is 1..max printable ASCII characters
 // (0x20-0x7E), the rule for X-End-User and Idempotency-Key (spec §4.1).
 func ValidHeaderValue(s string, max int) bool {
@@ -197,8 +222,13 @@ const (
 	BlobChunkBytes       = 96 << 10 // raw bytes per blob.chunk (base64url ≈128 KiB)
 	MaxBlobBytes         = 20 << 20
 	MaxTaskBlobBytes     = 32 << 20
-	InlineDataURIBytes   = 16 << 10 // data: URIs above this are moved to blobs
-	BlobScheme           = "lmbp-blob:"
+	// MaxToolCallIndex is the largest task.delta tool_calls[].index (§16.1).
+	MaxToolCallIndex = 127
+	// MaxTaskOutputBytes bounds the encoded task.delta bodies one task may
+	// send, cleartext or sealed (§10); beyond it the gateway cancels the task.
+	MaxTaskOutputBytes = 64 << 20
+	InlineDataURIBytes = 16 << 10 // data: URIs above this are moved to blobs
+	BlobScheme         = "lmbp-blob:"
 )
 
 // SessionToken carries a refreshed token plus a key proof over its jti.

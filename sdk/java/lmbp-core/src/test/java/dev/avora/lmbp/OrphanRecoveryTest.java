@@ -21,7 +21,7 @@ class OrphanRecoveryTest {
       store.createTask(t, null, null);
     }
     store.appendEvent("task_orphan_RUNNING", new Store.Event(1, "task.delta", Json.obj("text", "partial")));
-    LMBPServer lmbp = LMBPServer.builder().tenant("acme", "k".repeat(40), Map.of()).store(store).logger(s -> { }).retentionMillis(60_000).build();
+    LMBPServer lmbp = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", "k".repeat(40), Map.of()).store(store).logger(s -> { }).retentionMillis(60_000).build();
     try {
       for (String state : new String[] {"RUNNING", "QUEUED"}) {
         Store.TaskRecord t = store.getTask("task_orphan_" + state);

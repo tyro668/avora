@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -283,6 +284,7 @@ func (r *runner) run(ctx context.Context) error {
 	r.check("P2", "user_code matches XXXX-XXXX over BCDFGHJKLMNPQRSTVWXZ", want(userCodeRe.MatchString(uc), "got %q", uc))
 	r.check("P3", "device authorization response has Cache-Control: no-store", want(strings.Contains(h.Get("Cache-Control"), "no-store"), "got %q", h.Get("Cache-Control")))
 	r.runV2Pairing()
+	r.runHardenPairing(uc)
 	tok := func(proof string) (int, map[string]any) {
 		st, m, _, _ := r.form("/lmbp/v1/token", url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "device_code": {dc}, "proof": {proof}})
 		return st, m
@@ -445,6 +447,7 @@ func (r *runner) run(ctx context.Context) error {
 	}
 	r.checkCoreGap(ctx, conn, frames, full)
 	r.checkCoreBadTerminal(ctx, conn, frames, full)
+	r.checkOutputCap(ctx, conn, frames, full)
 	// cancellation
 	cctx, ccancel := context.WithCancel(ctx)
 	go func() { r.chat(cctx, full, true) }()
@@ -507,6 +510,7 @@ loop:
 	for range frames {
 	}
 	conn2, frames2 := r.runExt(ctx, key, at)
+	extOK := conn2 != nil
 	if conn2 == nil { // an extension step failed: the Core checks below still run on a plain session
 		h := lmbp.Hello{DeviceID: r.devID, Client: "lmbp-conformance", Models: []string{model}, MaxConcurrency: 1, Capabilities: lmbp.CoreCapabilities,
 			Proof: lmbp.SignProof(key, r.devID, lmbp.ProofHello, at, time.Now())}
@@ -519,6 +523,41 @@ loop:
 	}
 	defer conn2.Close()
 	frames = frames2
+	// V3: a task is in flight when the device is revoked
+	vModel := model
+	if extOK {
+		vModel = "conf-plain"
+	}
+	type vres struct {
+		st   int
+		body []byte
+	}
+	// The previous session's close may still be in flight at the gateway: wait until the model
+	// of this session is listed before starting the task.
+	for until := time.Now().Add(r.cfg.Timeout); time.Now().Before(until); time.Sleep(50 * time.Millisecond) {
+		if _, ml, _, _ := r.tenant(http.MethodGet, "/v1/models", nil); listsModel(ml, r.devID+"/"+vModel) {
+			break
+		}
+	}
+	inflight := make(chan vres, 1)
+	go func() {
+		s, _, b := r.chatRaw(ctx, map[string]any{"model": r.devID + "/" + vModel, "messages": []any{map[string]any{"role": "user", "content": "revoked mid-task"}}}, nil)
+		inflight <- vres{s, b}
+	}()
+	gotRun := false
+	tm = time.After(r.cfg.Timeout)
+vwait:
+	for !gotRun {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				break vwait
+			}
+			gotRun = f.Type == lmbp.TypeTaskRun
+		case <-tm:
+			break vwait
+		}
+	}
 	// revoke
 	st, _, _, _ = r.tenant(http.MethodPost, "/lmbp/v1/tenant/devices/"+url.PathEscape(r.devID)+"/revoke", nil)
 	closed := false
@@ -533,6 +572,13 @@ loop:
 	}
 done:
 	r.check("V1", "revoking the device closes its live session", want(st == 200 && closed, "status %d closed %v", st, closed))
+	var vr vres
+	select {
+	case vr = <-inflight:
+	case <-time.After(r.cfg.Timeout):
+	}
+	r.check("V3", "revoking a device while its task.run is in flight ends the caller's request with 502 OUTCOME_UNKNOWN, never 401 (§6.4, §7.5)",
+		want(gotRun && vr.st == 502 && errCode(vr.body) == lmbp.ErrOutcomeUnknown, "task.run seen %v, status %d body %s", gotRun, vr.st, vr.body))
 	st, m = refresh(assertion())
 	r.check("V2", "revoked device cannot obtain new tokens", want(m["error"] == "invalid_grant", "status %d %v", st, m))
 	return nil
@@ -773,6 +819,7 @@ func (r *runner) metadata() error {
 	}
 	r.check("M8", "metadata protocol_versions lists 2.0 and not 1.0; profiles lists core and only registered profiles (§11, §13)",
 		want(containsS(base.ProtocolVersions, "2.0") && !containsS(base.ProtocolVersions, "1.0") && profOK, "protocol_versions %v profiles %v", base.ProtocolVersions, base.Profiles))
+	r.checkForgedHost()
 	st, _, _, _ = r.tenant(http.MethodGet, lmbp.MetadataPath+"?tenant=no-such-tenant-"+lmbp.RandomID(""), nil)
 	if r.meta != nil {
 		r.check("M6", "gateway metadata validates against spec/schemas/gateway-metadata.json", r.validate(r.meta, b))
@@ -809,4 +856,78 @@ func (r *runner) metadata() error {
 		r.check("M5", "signed SaaS identity has name, requested_scopes from the registry, exp-iat <= 24h", want(sm.SaaS.Name != "" && len(sm.RequestedScopes) > 0 && badScope == "", "saas %+v scopes %v", sm.SaaS, sm.RequestedScopes))
 	}
 	return nil
+}
+
+// checkOutputCap (Z9, §10): a task whose device output exceeds 64 MiB fails:
+// task.cancel(protocol_error) to the device and an error to the caller.
+func (r *runner) checkOutputCap(ctx context.Context, conn *websocket.Conn, frames <-chan lmbp.Envelope, model string) {
+	const title = "device output beyond the per-task budget (64 MiB of task.delta) fails the task: task.cancel(protocol_error), caller gets 502 INTERNAL (§10)"
+	type res struct {
+		st   int
+		body []byte
+	}
+	out := make(chan res, 1)
+	go func() {
+		s, _, b := r.chatRaw(ctx, map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "flood"}}}, nil)
+		out <- res{s, b}
+	}()
+	run, err := r.awaitRun(frames)
+	if err != nil {
+		r.check("Z9", title, err)
+		<-out
+		return
+	}
+	chunk := strings.Repeat("a", 200<<10)
+	limit := int64(lmbp.MaxTaskOutputBytes/len(chunk) + 8)
+	var stop atomic.Bool
+	var sent atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for seq := int64(1); seq <= limit && !stop.Load(); seq++ {
+			if r.writeFrame(conn, "task.delta", "", run.TaskID, lmbp.TaskDelta{Text: chunk}, seq) != nil {
+				return
+			}
+			sent.Store(seq)
+		}
+	}()
+	reason := ""
+	tm := time.After(r.cfg.Timeout + 60*time.Second)
+wait:
+	for reason == "" {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				break wait
+			}
+			if f.Type == lmbp.TypeTaskCancel && f.TaskID == run.TaskID {
+				var c lmbp.TaskCancel
+				_ = json.Unmarshal(f.Data, &c)
+				reason = c.Reason
+			}
+		case <-tm:
+			break wait
+		}
+	}
+	stop.Store(true)
+	<-done
+	_ = r.writeFrame(conn, "task.error", "", run.TaskID, lmbp.ErrorBody{Code: lmbp.ErrCancelled, Message: "cancelled"}, sent.Load()+1)
+	rs := res{}
+	select {
+	case rs = <-out:
+	case <-time.After(r.cfg.Timeout):
+	}
+	_ = r.awaitAck(frames, run.TaskID, sent.Load()+1)
+	r.check("Z9", title, want(reason == "protocol_error" && rs.st == 502 && errCode(rs.body) == lmbp.ErrInternal, "cancel %q after %d frames, status %d body %.200s", reason, sent.Load(), rs.st, rs.body))
+}
+
+// listsModel reports whether a /v1/models response lists the model id.
+func listsModel(ml map[string]any, id string) bool {
+	data, _ := ml["data"].([]any)
+	for _, it := range data {
+		if mm, _ := it.(map[string]any); mm["id"] == id {
+			return true
+		}
+	}
+	return false
 }

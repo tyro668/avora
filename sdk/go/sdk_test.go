@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -48,14 +49,21 @@ func newRig(t *testing.T, st lmbpserver.Store) *rig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	srv, err := lmbpserver.New(ctx, lmbpserver.Options{Store: st, Logger: log.New(io.Discard, "", 0),
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := lmbpserver.New(ctx, lmbpserver.Options{Store: st, Logger: log.New(io.Discard, "", 0), Issuer: "http://" + l.Addr().String(),
 		Tenants: []lmbpserver.Tenant{{ID: "acme", APIKey: key, Profile: lmbpserver.TenantProfile{DisplayName: "Acme"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	app := http.NewServeMux()
 	app.HandleFunc("/app/hello", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "app") })
-	hs := httptest.NewServer(srv.Middleware(app))
+	hs := httptest.NewUnstartedServer(srv.Middleware(app))
+	hs.Listener.Close()
+	hs.Listener = l
+	hs.Start()
 	t.Cleanup(hs.Close)
 	return &rig{srv: srv, hs: hs}
 }
@@ -64,7 +72,7 @@ func newRig(t *testing.T, st lmbpserver.Store) *rig {
 func (r *rig) pair(t *testing.T, user string) string {
 	t.Helper()
 	ctx := context.Background()
-	info, err := r.srv.Pairing.Create("acme", r.hs.URL)
+	info, err := r.srv.Pairing.Create("acme")
 	if err != nil || !strings.HasPrefix(info.Link, "lmbp://pair?") || !strings.HasPrefix(info.QRSVG, "<svg") || len(info.QRPNG) < 100 {
 		t.Fatalf("create: %v %+v", err, info.Link)
 	}
@@ -79,7 +87,7 @@ func (r *rig) pair(t *testing.T, user string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pend, err := r.srv.Pairing.Lookup(ctx, "acme", p.UserCode)
+	pend, err := r.srv.Pairing.Lookup(ctx, "acme", "u1", p.UserCode)
 	if err != nil || pend.DeviceName != "laptop" || pend.Status != "pending" {
 		t.Fatalf("lookup %+v %v", pend, err)
 	}
@@ -244,7 +252,7 @@ func TestDenyAndBadCode(t *testing.T) {
 	if _, err := r.srv.Pairing.Approve(ctx, "acme", "alice", "ZZZZ-ZZZZ", ""); !errors.Is(err, lmbpserver.ErrCodeInvalid) {
 		t.Fatalf("bad code: %v", err)
 	}
-	info, _ := r.srv.Pairing.Create("acme", r.hs.URL)
+	info, _ := r.srv.Pairing.Create("acme")
 	req, err := client.PrepareLink(ctx, nil, info.Link)
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +291,7 @@ func TestSigningKeyPersistsInStore(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer st.Close()
-		s, err := lmbpserver.New(context.Background(), lmbpserver.Options{Store: st, Logger: log.New(io.Discard, "", 0)})
+		s, err := lmbpserver.New(context.Background(), lmbpserver.Options{Store: st, Issuer: "http://127.0.0.1:1", Logger: log.New(io.Discard, "", 0)})
 		if err != nil {
 			t.Fatal(err)
 		}

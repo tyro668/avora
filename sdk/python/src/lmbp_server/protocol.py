@@ -30,6 +30,26 @@ def char_len(s: str) -> int:
     return len(s)
 
 
+MAX_TOOL_CALL_INDEX = 127  # largest task.delta tool_calls[].index (spec §16.1)
+MAX_TASK_OUTPUT_BYTES = 64 << 20  # encoded task.delta bytes per task, cleartext or sealed (spec §10)
+MAX_DEVICE_NAME_CHARS = 100  # spec §6.2
+# Characters that can disguise text (spec §6.2): C0/C1 controls, U+00AD,
+# U+061C, U+180E, zero-width and directional marks, separators and embedding
+# controls, invisible operators, BOM, interlinear annotation controls.
+_DEVICE_NAME_FORBIDDEN = re.compile("[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]")
+
+
+def valid_device_name(s) -> bool:
+    """The spec §6.2 rule for the untrusted, device-reported name."""
+    if not isinstance(s, str) or char_len(s) > MAX_DEVICE_NAME_CHARS or _DEVICE_NAME_FORBIDDEN.search(s):
+        return False
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:  # lone surrogates
+        return False
+    return True
+
+
 def valid_header(s, max_len: int) -> bool:
     """1..max_len printable ASCII (0x20-0x7E): X-End-User, Idempotency-Key (spec §4.1)."""
     return isinstance(s, str) and 1 <= len(s) <= max_len and all(0x20 <= ord(c) <= 0x7E for c in s)

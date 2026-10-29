@@ -124,11 +124,12 @@ public final class SelfTest {
     });
 
     test("chat page with CSP, core endpoints, disabled chat page", () -> {
-      Gateway.Config cfg = new Gateway.Config();
-      cfg.webDir = ROOT.resolve("mock/web").toString();
-      Gateway g = new Gateway(cfg, new byte[32]);
       ServerSocket ss = Http.listen("127.0.0.1", 0);
       int port = ss.getLocalPort();
+      Gateway.Config cfg = new Gateway.Config();
+      cfg.issuer = "http://127.0.0.1:" + port;
+      cfg.webDir = ROOT.resolve("mock/web").toString();
+      Gateway g = new Gateway(cfg, new byte[32]);
       Thread.ofVirtual().start(() -> { try { Http.serve(ss, g); } catch (Exception e) { /* closed */ } });
       String[][] pages = {{"/", "text/html"}, {"/chat", "text/html"}, {"/chat/chat.js", "text/javascript"}, {"/chat/qrcode.js", "text/javascript"}};
       for (String[] pg : pages) {
@@ -152,7 +153,9 @@ public final class SelfTest {
     });
 
     test("outbox: forget fails the task's queued sends before waking others (audit3 P1)", () -> {
-      Gateway g = new Gateway(new Gateway.Config(), new byte[32]);
+      Gateway.Config cfg = new Gateway.Config();
+      cfg.issuer = "http://127.0.0.1";
+      Gateway g = new Gateway(cfg, new byte[32]);
       Lmbp.Outbox o = new Lmbp.Outbox(g);
       g.locked(() -> {
         o.setFlow(new Lmbp.Flow(Lmbp.MAX_FRAME_BYTES, Lmbp.MAX_FRAME_BYTES));

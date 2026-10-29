@@ -35,7 +35,7 @@ class V2Test {
   final HttpClient http = HttpClient.newHttpClient();
 
   FakeDevice paired() throws Exception {
-    lmbp = LMBPServer.builder().tenant("acme", KEY, Map.of("display_name", "Acme")).store(new MemoryStore()).logger(s -> { }).build();
+    lmbp = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", KEY, Map.of("display_name", "Acme")).store(new MemoryStore()).logger(s -> { }).build();
     srv = StandaloneServer.start(lmbp, "127.0.0.1", 0);
     base = "http://127.0.0.1:" + srv.port();
     FakeDevice d = new FakeDevice(base, "acme");

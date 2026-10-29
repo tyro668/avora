@@ -44,7 +44,8 @@ public final class LMBPServer implements AutoCloseable {
 
   private LMBPServer(Builder b) {
     Gateway.Config cfg = new Gateway.Config();
-    cfg.issuer = b.issuer == null ? "" : b.issuer;
+    if (b.issuer == null || b.issuer.isEmpty()) throw new IllegalArgumentException("issuer is required: the gateway's public origin (never derived from the Host header)");
+    cfg.issuer = b.issuer;
     cfg.maxConc = b.maxConcurrency;
     cfg.webDir = b.chatUiDir == null ? "" : b.chatUiDir;
     if (b.taskTimeoutMs > 0) cfg.taskTimeout = b.taskTimeoutMs;

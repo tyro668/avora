@@ -170,6 +170,7 @@ pub struct Task {
     acked: i64,
     persisted: i64,
     seen: i64,
+    out_bytes: usize,
     ack_at: i64,
     grace: Option<u64>,
     timeout: Option<u64>,
@@ -199,13 +200,83 @@ pub struct St {
     dstates: HashMap<u64, DState>,
     tasks: HashMap<String, u64>,
     tobj: HashMap<u64, Task>,
-    jtis: HashMap<String, i64>,
-    fails: HashMap<String, Vec<i64>>,
-    pending: Vec<String>,
+    jtis: JtiCache,
+    fails: HashMap<String, Vec<i64>>,                // tenant \0 end user -> failure times (last minute)
+    pending: HashMap<String, HashMap<String, i64>>, // tenant -> device_code hash -> expiry
+    auth_rate: WindowCounter,
     wss: HashMap<u64, WsState>,
     timers: HashMap<u64, Timer>,
     theap: BinaryHeap<Reverse<(Instant, u64)>>,
     next: u64,
+}
+
+/// Pairing abuse limits (spec §6.2-§6.4, §10).
+const AUTHORIZE_PER_MINUTE: u32 = 60;
+const MAX_PENDING_PER_TENANT: usize = 1000;
+const MAX_SLOW_DOWNS: i64 = 10;
+const FAILURES_PER_MINUTE: usize = 10;
+const INITIAL_INTERVAL: i64 = 2;
+
+/// Remembers proof/assertion jtis until they expire. Expired entries leave from the top of a
+/// min-heap ordered by expiry (O(log n) per call), never by scanning the whole set.
+#[derive(Default)]
+pub struct JtiCache {
+    seen: HashMap<String, i64>,
+    heap: BinaryHeap<Reverse<(i64, String)>>,
+}
+
+impl JtiCache {
+    fn evict(&mut self, now: i64) {
+        while let Some(Reverse((at, _))) = self.heap.peek() {
+            if *at >= now {
+                break;
+            }
+            let Reverse((at, j)) = self.heap.pop().unwrap();
+            if self.seen.get(&j) == Some(&at) {
+                self.seen.remove(&j);
+            }
+        }
+    }
+    pub fn has(&mut self, j: &str) -> bool {
+        self.evict(lmbp::now_ms());
+        self.seen.contains_key(j)
+    }
+    pub fn use_jti(&mut self, j: &str, until_ms: i64) -> bool {
+        self.evict(lmbp::now_ms());
+        if self.seen.contains_key(j) {
+            return false;
+        }
+        self.seen.insert(j.to_string(), until_ms);
+        self.heap.push(Reverse((until_ms, j.to_string())));
+        true
+    }
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// Counts events per key in fixed one-minute windows (the whole map is dropped when the window rolls).
+#[derive(Default)]
+struct WindowCounter {
+    start: i64,
+    n: HashMap<String, u32>,
+}
+
+impl WindowCounter {
+    fn allow(&mut self, key: &str, limit: u32) -> bool {
+        let now = lmbp::now_ms();
+        if now - self.start >= 60_000 {
+            self.start = now;
+            self.n.clear();
+        }
+        let c = self.n.entry(key.to_string()).or_insert(0);
+        if *c >= limit {
+            return false;
+        }
+        *c += 1;
+        true
+    }
 }
 
 static GW: OnceLock<Mutex<St>> = OnceLock::new();
@@ -230,9 +301,11 @@ pub fn log(s: &str) {
 
 /// init creates the global gateway; returns the key id.
 pub fn init(mut cfg: Config, seed: Option<[u8; 32]>) -> lmbp::R<String> {
-    if !cfg.issuer.is_empty() {
-        cfg.issuer = lmbp::origin(&cfg.issuer)?;
+    // §18.1: the issuer is configuration, never derived from a request's Host.
+    if cfg.issuer.is_empty() {
+        return Err("issuer is required (the gateway's public origin, e.g. https://gw.example.com)".into());
     }
+    cfg.issuer = lmbp::origin(&cfg.issuer)?;
     let seed = seed.unwrap_or_else(|| lmbp::random_bytes(32).try_into().unwrap());
     let key = SigningKey::from_bytes(&seed);
     let pub_ = key.verifying_key().to_bytes().to_vec();
@@ -248,9 +321,10 @@ pub fn init(mut cfg: Config, seed: Option<[u8; 32]>) -> lmbp::R<String> {
         dstates: HashMap::new(),
         tasks: HashMap::new(),
         tobj: HashMap::new(),
-        jtis: HashMap::new(),
+        jtis: JtiCache::default(),
         fails: HashMap::new(),
-        pending: vec![],
+        pending: HashMap::new(),
+        auth_rate: WindowCounter::default(),
         wss: HashMap::new(),
         timers: HashMap::new(),
         theap: BinaryHeap::new(),
@@ -365,22 +439,12 @@ impl St {
         self.tenants.iter().find(|t| t.id == id)
     }
 
-    fn issuer(&self, req: &Req) -> String {
-        if !self.cfg.issuer.is_empty() {
-            return self.cfg.issuer.clone();
-        }
-        let host = req.header("host");
-        lmbp::origin(&format!("http://{}", host)).unwrap_or_else(|_| format!("http://{}", host.to_lowercase()))
+    fn issuer(&self, _req: &Req) -> String {
+        self.cfg.issuer.clone()
     }
 
     fn use_jti(&mut self, j: &str, until_ms: i64) -> bool {
-        let t = lmbp::now_ms();
-        self.jtis.retain(|_, v| t <= *v);
-        if self.jtis.contains_key(j) {
-            return false;
-        }
-        self.jtis.insert(j.to_string(), until_ms);
-        true
+        self.jtis.use_jti(j, until_ms)
     }
 
     fn verify_access(&self, tok: &Value, iss: &str) -> lmbp::R<Obj> {
@@ -609,15 +673,23 @@ fn authorize(g: &mut Guard, req: &Req, res: &mut Res) {
     if req.method != "POST" {
         return oauth_error(g, res, 405, "invalid_request");
     }
+    // §6.2: limited per client address (the TCP peer) before anything is parsed or stored.
+    if !g.auth_rate.allow(&req.peer, AUTHORIZE_PER_MINUTE) {
+        res.set_header("Retry-After", "60");
+        return oauth_error(g, res, 429, "slow_down");
+    }
     let ps = match form_params(req, 4096) {
         Some(ps) if ps.get("tenant").map(|t| !t.is_empty()).unwrap_or(false)
-            && ps.get("device_name").map(|n| lmbp::char_len(n) <= 100).unwrap_or(true) => ps,
+            && ps.get("device_name").map(|n| lmbp::valid_device_name(n)).unwrap_or(true) => ps,
         _ => return oauth_error(g, res, 400, "invalid_request"),
     };
     let pub_ = match lmbp::unb64(ps.get("public_key").map(|s| s.as_str()).unwrap_or("")) {
         Ok(p) if p.len() == 32 => p,
         _ => return oauth_error(g, res, 400, "invalid_request"),
     };
+    if g.tenant(&ps["tenant"]).is_none() {
+        return oauth_error(g, res, 400, "invalid_client");
+    }
     let dc = lmbp::random_id("dc_");
     let d = DeviceAuth {
         code_hash: lmbp::sha_hex(&dc),
@@ -627,28 +699,58 @@ fn authorize(g: &mut Guard, req: &Req, res: &mut Res) {
         name: ps.get("device_name").cloned().unwrap_or_default(),
         status: "pending".into(),
         expires: lmbp::now_ms() + g.cfg.code_ttl * 1000,
-        interval: 2,
+        interval: INITIAL_INTERVAL,
         ..Default::default()
     };
     let uc = d.user_code.clone();
-    let ch = d.code_hash.clone();
+    if !reserve_pending(g, &d.tenant, &d.code_hash, d.expires) {
+        res.set_header("Retry-After", "60");
+        return oauth_error(g, res, 429, "slow_down");
+    }
     g.store.put_device_auth(d);
-    g.pending.push(ch);
     res.set_header("Cache-Control", "no-store");
     let ttl = g.cfg.code_ttl;
-    json_res(g, res, 200, &obj! {"device_code" => dc, "user_code" => uc, "expires_in" => ttl, "interval" => 2});
+    json_res(g, res, 200, &obj! {"device_code" => dc, "user_code" => uc, "expires_in" => ttl, "interval" => INITIAL_INTERVAL});
 }
 
-fn allow_attempt(g: &mut Guard, tenant: &str) -> bool {
+/// Counts a new pending pairing against its tenant's cap (expired entries are dropped first).
+fn reserve_pending(g: &mut Guard, tenant: &str, hash: &str, expires: i64) -> bool {
+    let now = lmbp::now_ms();
+    let m = g.pending.entry(tenant.to_string()).or_default();
+    m.retain(|_, at| now <= *at);
+    if m.len() >= MAX_PENDING_PER_TENANT {
+        return false;
+    }
+    m.insert(hash.to_string(), expires);
+    true
+}
+
+fn release_pending(g: &mut Guard, tenant: &str, hash: &str) {
+    if let Some(m) = g.pending.get_mut(tenant) {
+        m.remove(hash);
+        if m.is_empty() {
+            g.pending.remove(tenant);
+        }
+    }
+}
+
+// Failures are counted per end user of a tenant (§6.4). Callers hold the gateway lock, so the
+// check, the decision and the record are one atomic step: a code is decided once.
+fn allow_attempt(g: &mut Guard, tenant: &str, user: &str) -> bool {
+    let key = format!("{}\0{}", tenant, user);
     let cut = lmbp::now_ms() - 60_000;
-    let keep: Vec<i64> = g.fails.get(tenant).map(|v| v.iter().copied().filter(|t| *t > cut).collect()).unwrap_or_default();
+    let keep: Vec<i64> = g.fails.get(&key).map(|v| v.iter().copied().filter(|t| *t > cut).collect()).unwrap_or_default();
     let n = keep.len();
-    g.fails.insert(tenant.into(), keep);
-    n < 10
+    if keep.is_empty() {
+        g.fails.remove(&key);
+    } else {
+        g.fails.insert(key, keep);
+    }
+    n < FAILURES_PER_MINUTE
 }
 
-fn record_failure(g: &mut Guard, tenant: &str) {
-    g.fails.entry(tenant.into()).or_default().push(lmbp::now_ms());
+fn record_failure(g: &mut Guard, tenant: &str, user: &str) {
+    g.fails.entry(format!("{}\0{}", tenant, user)).or_default().push(lmbp::now_ms());
 }
 
 fn approve(g: &mut Guard, req: &Req, res: &mut Res, mode: Mode) {
@@ -678,16 +780,16 @@ fn approve(g: &mut Guard, req: &Req, res: &mut Res, mode: Mode) {
 
 type PairErr = (u16, &'static str, &'static str);
 
-/// The one entry for approving/denying a user code; enforces the per-tenant failed-code lockout.
+/// The one entry for approving/denying a user code; enforces the per-user failed-code lockout.
 pub fn pair_decide(g: &mut Guard, tenant: &str, owner: &str, user_code: &str, deny: bool, jkt: Option<&str>) -> Result<DeviceAuth, PairErr> {
-    if !allow_attempt(g, tenant) {
+    if !allow_attempt(g, tenant, owner) {
         return Err((429, "RATE_LIMITED", "too many failed codes; wait a minute"));
     }
     let code = norm_code(user_code);
     let d = if code.is_empty() { None } else { g.store.device_auth_by_user_code(tenant, &code) };
     let now = lmbp::now_ms();
     let fail = |g: &mut Guard, e: PairErr| {
-        record_failure(g, tenant);
+        record_failure(g, tenant, owner);
         Err(e)
     };
     // §19: a declined pairing cannot be overridden by a later approval.
@@ -722,7 +824,7 @@ pub fn pair_decide(g: &mut Guard, tenant: &str, owner: &str, user_code: &str, de
         });
     }
     g.store.put_device_auth(d.clone());
-    g.pending.retain(|h| h != &d.code_hash);
+    release_pending(g, tenant, &d.code_hash);
     Ok(d)
 }
 
@@ -746,16 +848,14 @@ fn token(g: &mut Guard, req: &Req, res: &mut Res) {
     if gt == "urn:ietf:params:oauth:grant-type:device_code" {
         let dcode = ps.get("device_code").cloned().unwrap_or_default();
         let Some(mut d) = g.store.get_device_auth(&lmbp::sha_hex(&dcode)) else { return oauth_error(g, res, 400, "invalid_grant") };
-        let ok = match lmbp::verify_proof(&d.pub_, &pv("proof"), "", lmbp::PROOF_TOKEN, &dcode, lmbp::now()) {
-            Ok(pc) => {
-                let j = json::js_string(pc.get("jti").unwrap_or(&Value::Null));
-                g.use_jti(&j, lmbp::now_ms() + 180_000)
-            }
-            Err(_) => false,
+        let jti = match lmbp::verify_proof(&d.pub_, &pv("proof"), "", lmbp::PROOF_TOKEN, &dcode, lmbp::now()) {
+            Ok(pc) => json::js_string(pc.get("jti").unwrap_or(&Value::Null)),
+            Err(_) => return oauth_error(g, res, 400, "invalid_grant"),
         };
-        if !ok {
+        if g.jtis.has(&jti) {
             return oauth_error(g, res, 400, "invalid_grant");
         }
+        // A code that can no longer yield a token answers without remembering the proof's jti.
         let now = lmbp::now_ms();
         if now > d.expires {
             return oauth_error(g, res, 400, "expired_token");
@@ -763,16 +863,26 @@ fn token(g: &mut Guard, req: &Req, res: &mut Res) {
         match d.status.as_str() {
             "denied" => return oauth_error(g, res, 400, "access_denied"),
             "consumed" => return oauth_error(g, res, 400, "invalid_grant"),
-            "pending" => {
-                let slow = now - d.last_poll < d.interval * 1000 - 200;
-                d.last_poll = now;
-                if slow {
-                    d.interval += 5;
-                }
-                g.store.put_device_auth(d);
-                return oauth_error(g, res, 400, if slow { "slow_down" } else { "authorization_pending" });
-            }
             _ => {}
+        }
+        if !g.use_jti(&jti, now + 180_000) {
+            return oauth_error(g, res, 400, "invalid_grant");
+        }
+        if d.status == "pending" {
+            let slow = now - d.last_poll < d.interval * 1000 - 200;
+            d.last_poll = now;
+            if slow {
+                d.interval += 5;
+            }
+            // §6.3: a device that keeps ignoring slow_down loses its code.
+            let dead = (d.interval - INITIAL_INTERVAL) / 5 > MAX_SLOW_DOWNS;
+            if dead {
+                d.expires = now;
+                let (t, h) = (d.tenant.clone(), d.code_hash.clone());
+                release_pending(g, &t, &h);
+            }
+            g.store.put_device_auth(d);
+            return oauth_error(g, res, 400, if dead { "expired_token" } else if slow { "slow_down" } else { "authorization_pending" });
         }
         let Some(dev) = g.store.get_device(&d.device_id) else { return oauth_error(g, res, 500, "server_error") };
         d.status = "consumed".into();
@@ -847,19 +957,8 @@ fn list_devices(g: &mut Guard, req: &Req, res: &mut Res, mode: Mode) {
         }
         out.push(item);
     }
-    let now = lmbp::now_ms();
-    let mut pend = vec![];
-    let mut keep = vec![];
-    for h in std::mem::take(&mut g.pending) {
-        if let Some(d) = g.store.get_device_auth(&h).filter(|d| d.status == "pending" && now <= d.expires) {
-            if d.tenant == a.tenant {
-                pend.push(obj! {"device_name" => d.name.clone(), "jkt" => lmbp::thumbprint(&d.pub_), "expires_at" => iso8601(d.expires / 1000)});
-            }
-            keep.push(h);
-        }
-    }
-    g.pending = keep;
-    json_res(g, res, 200, &obj! {"devices" => out, "pending_pairings" => pend});
+    // Pending pairings are never listed (§6.4, §12.6): approval needs the code shown on the device.
+    json_res(g, res, 200, &obj! {"devices" => out});
 }
 
 fn revoke(g: &mut Guard, req: &Req, res: &mut Res, mode: Mode, id: &str) {
@@ -877,7 +976,7 @@ pub fn revoke_device(g: &mut Guard, tenant: &str, owner: &str, id: &str) -> bool
     let Some(mut d) = g.store.get_device(id).filter(|d| d.tenant == tenant && d.owner == owner) else { return false };
     d.status = "revoked".into();
     g.store.put_device(d);
-    drop_device(g, id, "UNAUTHENTICATED", "device revoked");
+    drop_device(g, id, "DEVICE_OFFLINE", "device revoked"); // in-flight tasks: OUTCOME_UNKNOWN (§7.5)
     true
 }
 
@@ -2285,6 +2384,7 @@ fn task_new(g: &mut Guard, ds: Option<u64>, id: &str, tenant: &str, owner: &str,
         acked: 0,
         persisted: 0,
         seen: 0,
+        out_bytes: 0,
         ack_at: lmbp::now_ms(),
         grace: None,
         timeout: None,
@@ -2382,6 +2482,14 @@ fn task_on_device_frame(g: &mut Guard, tk: u64, inp: &Value, seq: i64) {
     if ty == "task.delta" && !t.e2ee && truthy(get(&data, "e2ee")) {
         data.as_object_mut().unwrap().remove("e2ee");
     }
+    if ty == "task.delta" {
+        if let Some(why) = check_delta(t, &data) {
+            log(&format!("lmbp: task {}: {}", t.id, why));
+            task_cancel(g, tk, "protocol_error");
+            task_fail_local(g, tk, "INTERNAL", &format!("device sent an invalid delta: {}", why), false);
+            return;
+        }
+    }
     let id = t.id.clone();
     let ev = Event { seq, ty: ty.clone(), data };
     let mut state = "";
@@ -2470,12 +2578,37 @@ fn task_commit_local(g: &mut Guard, tk: u64, code: &str, msg: &str, retryable: b
     task_finish(g, tk, if code == "CANCELLED" { "CANCELLED" } else { "FAILED" }, false);
 }
 
+/// Ends a task whose device session is gone, whatever ended it (disconnect, revocation,
+/// replacement): once task.run was sent the device may have run it, so OUTCOME_UNKNOWN (§7.5);
+/// before that DEVICE_OFFLINE (retryable).
 fn task_fail_offline(g: &mut Guard, tk: u64, code: &str, msg: &str) {
     let Some(t) = g.tobj.get(&tk) else { return };
-    if code == "DEVICE_OFFLINE" && t.sent_run {
-        return task_fail_local(g, tk, "OUTCOME_UNKNOWN", &format!("{}; outcome unknown", msg), false);
+    if t.sent_run {
+        let msg = if code == "OUTCOME_UNKNOWN" { msg.to_string() } else { format!("{}; outcome unknown", msg) };
+        return task_fail_local(g, tk, "OUTCOME_UNKNOWN", &msg, false);
     }
-    task_fail_local(g, tk, code, msg, code == "DEVICE_OFFLINE");
+    task_fail_local(g, tk, "DEVICE_OFFLINE", msg, true);
+}
+
+/// Validates a device delta before it is stored or aggregated: the tool-call index range
+/// (§16.1) and the task's output budget (§10), which counts every encoded delta body, cleartext
+/// or sealed.
+fn check_delta(t: &mut Task, data: &Value) -> Option<String> {
+    if !t.e2ee {
+        if let Some(calls) = get(data, "tool_calls").as_array() {
+            for c in calls {
+                let Some(ix) = c.as_object().and_then(|m| m.get("index")) else { continue };
+                if !json::is_int(ix) || json::int(ix) < 0 || json::int(ix) > lmbp::MAX_TOOL_CALL_INDEX {
+                    return Some(format!("tool call index {} out of range [0,{}]", json::stringify(ix), lmbp::MAX_TOOL_CALL_INDEX));
+                }
+            }
+        }
+    }
+    t.out_bytes += json::stringify(data).len();
+    if t.out_bytes > lmbp::MAX_TASK_OUTPUT_BYTES {
+        return Some("task output exceeds the per-task limit".into());
+    }
+    None
 }
 
 fn task_finish(g: &mut Guard, tk: u64, _state: &str, from_device: bool) {

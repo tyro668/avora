@@ -65,8 +65,9 @@ type Tenant struct {
 // Options configure a Server.
 type Options struct {
 	Tenants []Tenant
-	// Issuer is the gateway's public https origin. Empty = development mode
-	// (derived from each request's Host), which must not be used in production.
+	// Issuer is the gateway's public origin (https, or http on loopback for
+	// development), REQUIRED: every token, audience, metadata document and
+	// pair link is bound to it. It is never derived from a request's Host.
 	Issuer string
 	// Store defaults to NewMemoryStore().
 	Store Store
@@ -95,6 +96,9 @@ const seedSecret = "gateway_signing_seed"
 
 // New builds a server. ctx bounds background work (retention purge).
 func New(ctx context.Context, o Options) (*Server, error) {
+	if o.Issuer == "" {
+		return nil, errors.New("lmbpserver: Options.Issuer is required (the gateway's public origin)")
+	}
 	if o.Store == nil {
 		o.Store = NewMemoryStore()
 	}

@@ -43,20 +43,18 @@ public class LmbpClient {
   /**
    * Deep link ({@code lmbp://pair?...}) to show {@code userId} as a link or QR code. The link itself is
    * the same for every user; the device is bound to {@code userId} when you call {@link #approve(String, String)}
-   * with the code the desktop app displays. Uses {@code lmbp.issuer}, or the current request's origin in dev mode.
+   * with the code the desktop app displays. Uses {@code lmbp.issuer} (never the request's Host).
    */
   public String pairLink(String userId) {
     require(userId);
-    String iss = props.getIssuer();
-    if (iss == null || iss.isEmpty()) {
-      HttpServletRequest r = current();
-      if (r == null) throw new IllegalStateException("lmbp.issuer is empty and there is no current request");
-      iss = r.getScheme() + "://" + r.getHeader("Host");
-    }
-    return lmbp.pairing().link(props.getTenant(), iss);
+    return lmbp.pairing().link(props.getTenant());
   }
 
-  public Pairing.Pending lookup(String userCode) { return lmbp.pairing().lookup(props.getTenant(), userCode); }
+  /**
+   * The pending pairing for the code {@code userId} typed; its device name is untrusted text. Wrong codes count
+   * as failed attempts of {@code userId}.
+   */
+  public Pairing.Pending lookup(String userId, String userCode) { return lmbp.pairing().lookup(props.getTenant(), require(userId), userCode); }
 
   /** Approves the code shown on the desktop for {@code userId}; throws {@link Pairing.PairingException}. */
   public Pairing.Decision approve(String userId, String userCode) { return lmbp.pairing().approve(props.getTenant(), require(userId), userCode); }

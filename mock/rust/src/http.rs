@@ -22,6 +22,8 @@ pub struct Req {
     pub headers: BTreeMap<String, String>,
     pub body: Option<Vec<u8>>, // None if over MAX_BODY
     pub abort: Abort,
+    /// TCP peer address (the per-client key of the authorize rate limit).
+    pub peer: String,
 }
 
 pub fn dec(s: &str) -> String {
@@ -208,6 +210,7 @@ fn read_n<R: Read>(r: &mut R, n: usize) -> Vec<u8> {
 
 fn conn(s: TcpStream) {
     let _ = s.set_nodelay(true);
+    let peer = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let Ok(out) = s.try_clone() else { return };
     let mut inp = BufReader::new(s);
     let mut budget = MAX_HEADER_BYTES;
@@ -221,7 +224,7 @@ fn conn(s: TcpStream) {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.clone(), String::new()),
     };
-    let mut req = Req { method: rl[0].to_string(), path, query, headers: BTreeMap::new(), body: Some(vec![]), abort: Arc::new(AtomicBool::new(false)) };
+    let mut req = Req { method: rl[0].to_string(), path, query, headers: BTreeMap::new(), body: Some(vec![]), abort: Arc::new(AtomicBool::new(false)), peer };
     loop {
         let Some(h) = read_line(&mut inp, &mut budget) else { break };
         if h.is_empty() {

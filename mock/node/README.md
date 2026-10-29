@@ -19,7 +19,7 @@ node gateway.mjs --listen 127.0.0.1:8080 --tenant-profiles ../tenant-profiles.ex
 | 参数 / 环境变量 | 说明 |
 |---|---|
 | `--listen` / `LMBP_LISTEN` | 监听地址，默认 `127.0.0.1:8080` |
-| `--issuer` / `LMBP_ISSUER` | 网关 issuer origin（https；回环地址可用 http）。不设置时取请求的 origin（开发模式） |
+| `--issuer` / `LMBP_ISSUER` | 网关 issuer origin（https；回环地址可用 http）。不设置时：`--listen` 为回环地址则用 `http://<listen>`，否则拒绝启动；issuer 从不取自请求 Host |
 | `--tenant id:ENV` | 注册租户，API Key 从环境变量读取（可重复） |
 | `--tenant-profiles F` / `LMBP_TENANT_PROFILES` | 租户 JSON 文件，格式见 `../tenant-profiles.example.json` |
 | `LMBP_SIGNING_SEED` | 32 字节十六进制 Ed25519 种子；不设置则每次启动随机生成 |

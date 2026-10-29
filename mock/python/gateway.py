@@ -17,11 +17,20 @@ from lmbp_server.engine import WEB_CSP, WEB_FILES, Gateway  # noqa: F401  (re-ex
 from lmbp_server.protocol import MAX_FRAME_BYTES
 
 
+def loopback_issuer(listen):
+    """Default issuer for a loopback --listen address; any other address needs --issuer (spec §18.1)."""
+    host = listen.rpartition(":")[0].strip("[]")
+    if host in ("localhost", "::1") or host.startswith("127."):
+        return f"http://{listen}"
+    sys.exit(f"--issuer (or LMBP_ISSUER) is required when listening on {listen}")
+
+
 def build(argv=None):
     ap = argparse.ArgumentParser(description="LMBP mock SaaS gateway (Python)")
     ap.add_argument("--listen", default=os.environ.get("LMBP_LISTEN", "127.0.0.1:8080"))
     ap.add_argument("--issuer", default=os.environ.get("LMBP_ISSUER", ""),
-                    help="gateway issuer origin (https; http only for loopback). Default: request origin (dev mode)")
+                    help="gateway public origin (https; http only for loopback). Required unless --listen is a loopback "
+                         "address, where it defaults to http://<listen>. Never derived from a request's Host header.")
     ap.add_argument("--tenant", action="append", default=[], metavar="ID:ENV",
                     help="register tenant ID whose API key (>= 32 chars) is read from env var ENV")
     ap.add_argument("--tenant-profiles", default=os.environ.get("LMBP_TENANT_PROFILES", ""),
@@ -53,7 +62,7 @@ def build(argv=None):
                 tenants.append(TenantConfig(tid, key, p))
     if not tenants:
         print("warning: no tenants registered (use --tenant id:ENV_VAR)", file=sys.stderr)
-    lmbp = LMBPServer(tenants, issuer=a.issuer, retention=a.retention_seconds, signing_seed=bytes.fromhex(seed_hex) if seed_hex else None,
+    lmbp = LMBPServer(tenants, issuer=a.issuer or loopback_issuer(a.listen), retention=a.retention_seconds, signing_seed=bytes.fromhex(seed_hex) if seed_hex else None,
                      max_concurrency=a.max_concurrency, chat_ui_dir="" if a.no_chat_ui else a.web_dir,
                      store=SQLiteStore(a.db) if a.db else None)
     return a, lmbp
@@ -62,7 +71,7 @@ def build(argv=None):
 def main():
     a, lmbp = build()
     host, _, port = a.listen.rpartition(":")
-    print(f"lmbp python mock gateway listening on {a.listen} issuer={lmbp.engine.cfg['issuer'] or '(request origin, dev mode)'} kid={lmbp.keys.kid()}",
+    print(f"lmbp python mock gateway listening on {a.listen} issuer={lmbp.engine.cfg['issuer']} kid={lmbp.keys.kid()}",
           file=sys.stderr, flush=True)
     uvicorn.run(lmbp.asgi(), host=host or "0.0.0.0", port=int(port), log_level="warning", ws="websockets",
                 ws_max_size=MAX_FRAME_BYTES, ws_ping_interval=20, ws_ping_timeout=20)

@@ -8,6 +8,7 @@ import httpx
 
 from lmbp_server import LMBPServer, TenantConfig
 from simdevice import pair_and_connect
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -30,7 +31,7 @@ def err_param(b):
 
 async def test_param_vectors(serve_app):
     assert len(V["cases"]) >= 80
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
     runs = {}
     failures = []
     async with serve_app(lmbp.asgi()) as base:

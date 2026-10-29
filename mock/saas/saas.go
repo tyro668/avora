@@ -286,7 +286,7 @@ button:hover{background:var(--brand-hover)}button.sec{background:#fff;color:var(
 <p><input name="password" type="password" placeholder="密码" style="width:100%"></p><button style="width:100%">登录</button></form></div></body></html>{{end}}
 {{define "link"}}{{template "head"}}<header><h1>Mock SaaS · 设备授权</h1><span class="sp"></span><span>当前用户：<b>{{.User}}</b></span><a href="/">返回对话</a></header>
 <div class="auth-box" style="max-width:480px"><h3>连接本机设备</h3><p style="color:var(--mut)">在桌面连接器上会显示一个 8 位配对码（如 <span class="code" style="font-size:16px">BCDF-GHJK</span>），请在这里输入并确认。</p>
-{{if .Result}}<p class="ok">已{{if eq (index .Result "status") "approved"}}连接{{else}}拒绝{{end}}设备：{{index .Result "device_name"}} {{index .Result "device_id"}}</p>{{end}}
+{{if .Result}}<p class="ok">已{{if eq (index .Result "status") "approved"}}连接{{else}}拒绝{{end}}设备（设备自报名称：{{index .Result "device_name"}}，设备 ID：{{index .Result "device_id"}}）</p>{{end}}
 {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
 <form method="post" action="/link"><input type="hidden" name="jkt" value="{{.JKT}}"><p><input name="user_code" value="{{.Code}}" placeholder="XXXX-XXXX" class="code" style="width:100%" autocomplete="off"></p>
 <div style="display:flex;gap:8px"><button style="flex:1">确认连接</button> <button name="deny" value="1" class="sec">拒绝</button></div></form></div></body></html>{{end}}
@@ -301,9 +301,12 @@ button:hover{background:var(--brand-hover)}button.sec{background:#fff;color:var(
 <script>
 const chatEl=document.getElementById('chat');let history=[];
 function addTurn(role,text){const t=document.createElement('div');t.className='turn '+role;const w=document.createElement('div');w.className='who';w.textContent=role==='user'?'我':'AI 助手';const b=document.createElement('div');b.className='bubble';b.textContent=text;t.append(w,b);chatEl.append(t);chatEl.scrollTop=chatEl.scrollHeight;return b;}
+function node(tag,text,css){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(css)n.style.cssText=css;return n;}
+// Device names and model ids are reported by the device: always plain text, never HTML.
 async function load(){const d=await (await fetch('/api/devices')).json();const el=document.getElementById('devices');
-el.innerHTML=(d.devices||[]).map(x=>'<div style="padding:6px 0;border-top:1px solid #f1f3f5">'+(x.online?'🟢':'⚪')+' <b>'+x.name+'</b><br><code style="font-size:11px;color:#6b7280">'+x.device_id+'</code> · '+(x.models||[]).join(', ')+'</div>').join('')||'还没有设备';
-const m=await (await fetch('/api/models')).json();const sel=document.getElementById('model'),prev=sel.value;sel.innerHTML=(m.data||[]).map(x=>'<option>'+x.id+'</option>').join('');if(prev)sel.value=prev;}
+el.replaceChildren(...(d.devices||[]).map(x=>{const r=node('div',undefined,'padding:6px 0;border-top:1px solid #f1f3f5');const b=node('b',x.name||'未命名设备');b.title='设备自报名称（由设备提供，仅供参考）';
+r.append((x.online?'🟢':'⚪')+' ',b,node('br'),node('code',x.device_id,'font-size:11px;color:#6b7280'),' · '+(x.models||[]).join(', '));return r;}));if(!(d.devices||[]).length)el.textContent='还没有设备';
+const m=await (await fetch('/api/models')).json();const sel=document.getElementById('model'),prev=sel.value;sel.replaceChildren(...(m.data||[]).map(x=>node('option',x.id)));if(prev)sel.value=prev;}
 let ctl;const sendBtn=document.getElementById('send'),stopBtn=document.getElementById('stop'),promptEl=document.getElementById('prompt');
 document.getElementById('clear').onclick=()=>{if(ctl)ctl.abort();history=[];chatEl.textContent='';};
 promptEl.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendBtn.click();}});

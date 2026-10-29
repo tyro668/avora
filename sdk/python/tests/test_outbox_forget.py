@@ -13,6 +13,7 @@ import httpx
 from lmbp_server import LMBPServer, MemoryStore, TenantConfig
 from lmbp_server import protocol as L
 from simdevice import connect, finish_pairing, start_pairing
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -33,7 +34,7 @@ def body():
 
 
 async def test_cancel_while_chunks_wait_then_resume_no_credit_leak(serve_app):
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=MemoryStore(), log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=MemoryStore(), log=lambda *a: None)
     state = {"answer": False, "token": ""}
 
     def manual(run, ws, listeners):

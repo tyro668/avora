@@ -30,21 +30,31 @@ public final class Pairing {
     public String code() { return code; }
   }
 
-  /** §19.4 deep link for the desktop app ({@code lmbp://pair?...}); uses the configured issuer. */
-  public String link(String tenant) { return link(tenant, null); }
-
-  public String link(String tenant, String issuer) {
-    String iss = issuer != null && !issuer.isEmpty() ? issuer : s.g.cfg.issuer;
-    if (iss.isEmpty()) throw new IllegalStateException("pairing link needs an issuer (configure issuer or pass one)");
+  /** §19.4 deep link for the desktop app ({@code lmbp://pair?...}) on the configured issuer. */
+  public String link(String tenant) {
     if (!s.g.tenants.containsKey(tenant)) throw new IllegalArgumentException("unknown tenant " + tenant);
-    return "lmbp://pair?v=" + Lmbp.PAIR_LINK_VERSION + "&gateway=" + URLEncoder.encode(Lmbp.origin(iss), StandardCharsets.UTF_8) + "&tenant=" + URLEncoder.encode(tenant, StandardCharsets.UTF_8);
+    return "lmbp://pair?v=" + Lmbp.PAIR_LINK_VERSION + "&gateway=" + URLEncoder.encode(s.g.cfg.issuer, StandardCharsets.UTF_8) + "&tenant=" + URLEncoder.encode(tenant, StandardCharsets.UTF_8);
   }
 
-  public Pending lookup(String tenant, String userCode) {
-    Store.DeviceAuth[] d = {null};
-    s.g.locked(() -> d[0] = s.g.store.deviceAuthByUserCode(tenant, Gateway.normCode(userCode == null ? "" : userCode)));
-    if (d[0] == null) return null;
-    return new Pending(d[0].userCode, d[0].name, Lmbp.thumbprint(d[0].pub), d[0].status, Instant.ofEpochMilli(d[0].expires));
+  /**
+   * Pending pairing for the user code {@code endUser} typed (shown on their desktop), to show the
+   * device before approving. {@code deviceName} is untrusted text chosen by the device: render it as
+   * plain text. A code that is not pending returns null and counts as a failed attempt of
+   * {@code endUser} ({@link PairingException} RATE_LIMITED after 10 a minute).
+   */
+  public Pending lookup(String tenant, String endUser, String userCode) {
+    checkCaller(tenant, endUser);
+    Gateway.PairResult[] r = {null};
+    s.g.locked(() -> r[0] = s.g.pairLookup(tenant, endUser, userCode));
+    if (r[0].status == 429) throw new PairingException("RATE_LIMITED", r[0].message);
+    if (r[0].d == null) return null;
+    Store.DeviceAuth d = r[0].d;
+    return new Pending(d.userCode, d.name, Lmbp.thumbprint(d.pub), d.status, Instant.ofEpochMilli(d.expires));
+  }
+
+  private void checkCaller(String tenant, String endUser) {
+    if (!s.g.tenants.containsKey(tenant)) throw new PairingException("BAD_REQUEST", "unknown tenant");
+    if (!Lmbp.validHeader(endUser, 128)) throw new PairingException("BAD_REQUEST", "end user must be 1-128 printable ASCII characters (it travels as X-End-User)");
   }
 
   /** Approves the code shown on the user's desktop for {@code endUser}; optional {@code jkt} pins the expected device key. */
@@ -56,8 +66,7 @@ public final class Pairing {
   public Decision deny(String tenant, String endUser, String userCode) { return decide(tenant, endUser, userCode, true, null); }
 
   private Decision decide(String tenant, String endUser, String userCode, boolean deny, String jkt) {
-    if (!s.g.tenants.containsKey(tenant)) throw new PairingException("BAD_REQUEST", "unknown tenant");
-    if (!Lmbp.validHeader(endUser, 128)) throw new PairingException("BAD_REQUEST", "end user must be 1-128 printable ASCII characters (it travels as X-End-User)");
+    checkCaller(tenant, endUser);
     Gateway.PairResult[] r = {null};
     s.g.locked(() -> r[0] = s.g.pairDecide(tenant, endUser, userCode == null ? "" : userCode, deny, jkt));
     Gateway.PairResult p = r[0];

@@ -5,6 +5,7 @@ import Fastify from 'fastify';
 import express from 'express';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const T = 'acme';
@@ -12,11 +13,12 @@ const chat = (base, body, path = '/v1/chat/completions') => fetch(base + path, {
   headers: { Authorization: 'Bearer ' + KEY, 'X-End-User': 'u1', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
 test('fastify plugin: protocol routes, WebSocket upgrade and chat next to app routes', async () => {
-  const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY }], log: () => {} });
   const app = Fastify();
   await app.register(lmbp.fastifyPlugin);
   app.get('/app/hello', async () => ({ hi: true }));
-  await app.listen({ port: 0, host: '127.0.0.1' });
+  await app.listen({ port: lmbpPort, host: '127.0.0.1' });
   const base = `http://127.0.0.1:${app.server.address().port}`;
   try {
     assert.deepEqual(await (await fetch(base + '/app/hello')).json(), { hi: true });
@@ -31,7 +33,8 @@ test('fastify plugin: protocol routes, WebSocket upgrade and chat next to app ro
 
 test('express: middleware before and after express.json()', async () => {
   for (const order of ['before', 'after']) {
-    const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY }], log: () => {} });
+    const lmbpPort = await freePort();
+    const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY }], log: () => {} });
     const app = express();
     if (order === 'after') app.use(express.json());
     app.use(lmbp.middleware());
@@ -39,7 +42,7 @@ test('express: middleware before and after express.json()', async () => {
     app.post('/app/echo', (req, res) => res.json(req.body));
     const srv = http.createServer(app);
     lmbp.attach(srv);
-    await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+    await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
     const base = `http://127.0.0.1:${srv.address().port}`;
     try {
       const { ws } = await pairAndConnect(lmbp, base, T, 'u1');

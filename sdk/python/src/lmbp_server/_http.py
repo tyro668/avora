@@ -53,6 +53,7 @@ class Request:
         self.match_info: dict[str, str] = {}
         self.secure = scope.get("scheme") in ("https", "wss")
         self.host = self.headers.get("Host") or ("%s:%d" % tuple(scope["server"]) if scope.get("server") else "localhost")
+        self.peer = (scope.get("client") or ("", 0))[0] or ""  # TCP peer; forwarding headers are not trusted
         self.is_websocket = scope["type"] == "websocket"
         self.anthropic = False
         self._body = body

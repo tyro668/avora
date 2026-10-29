@@ -26,7 +26,7 @@ class EngineTest {
   FakeDevice dev;
 
   String start(Store store) throws Exception {
-    lmbp = LMBPServer.builder().tenant("acme", KEY, Map.of("display_name", "Acme")).store(store).logger(s -> { }).build();
+    lmbp = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", KEY, Map.of("display_name", "Acme")).store(store).logger(s -> { }).build();
     srv = StandaloneServer.start(lmbp, "127.0.0.1", 0);
     return "http://127.0.0.1:" + srv.port();
   }
@@ -34,7 +34,7 @@ class EngineTest {
   void pairAndConnect(String base) throws Exception {
     dev = new FakeDevice(base, "acme");
     String code = dev.authorize();
-    Pairing.Pending p = lmbp.pairing().lookup("acme", code);
+    Pairing.Pending p = lmbp.pairing().lookup("acme", "alice", code);
     assertEquals("pending", p.status());
     assertEquals("test-pc", p.deviceName());
     Pairing.Decision d = lmbp.pairing().approve("acme", "alice", code);
@@ -207,7 +207,7 @@ class EngineTest {
   // Review7 #10: a caller that disconnects while queued records CANCELLED (the
   // decided outcome), and an idempotent replay reports exactly that.
   @Test void queuedDisconnectRecordsCancelled() throws Exception {
-    lmbp = LMBPServer.builder().tenant("acme", KEY, Map.of("display_name", "Acme")).store(new MemoryStore()).maxConcurrency(1).logger(s -> { }).build();
+    lmbp = LMBPServer.builder().issuer("http://127.0.0.1").tenant("acme", KEY, Map.of("display_name", "Acme")).store(new MemoryStore()).maxConcurrency(1).logger(s -> { }).build();
     srv = StandaloneServer.start(lmbp, "127.0.0.1", 0);
     dev = new FakeDevice("http://127.0.0.1:" + srv.port(), "acme");
     String code = dev.authorize();

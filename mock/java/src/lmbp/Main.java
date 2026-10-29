@@ -51,7 +51,7 @@ public final class Main {
     else System.err.println("warning: no signing key; using an ephemeral key (tokens do not survive restarts)");
     if (seed != null && seed.length != 32) die(seedEnv + " must hold 32 bytes of hex");
     Gateway.Config cfg = new Gateway.Config();
-    cfg.issuer = issuer;
+    cfg.issuer = issuer.isEmpty() ? loopbackIssuer(listen) : issuer;
     cfg.maxConc = maxConc;
     if (retention != 0) cfg.retention = retention;
     if (webDir.isEmpty()) {
@@ -88,8 +88,17 @@ public final class Main {
     String host = colon < 0 ? "" : listen.substring(0, colon);
     int port = Integer.parseInt(colon < 0 ? listen : listen.substring(colon + 1));
     ServerSocket ss = Http.listen(host, port);
-    System.err.println("lmbp java mock gateway listening on " + listen + " issuer=" + (cfg.issuer.isEmpty() ? "(request origin, dev mode)" : cfg.issuer) + " kid=" + g.kid);
+    System.err.println("lmbp java mock gateway listening on " + listen + " issuer=" + cfg.issuer + " kid=" + g.kid);
     Http.serve(ss, g);
+  }
+
+  /** The default issuer for a loopback --listen address; any other address needs --issuer (spec §18.1). */
+  static String loopbackIssuer(String listen) {
+    int i = listen.lastIndexOf(':');
+    String h = (i < 0 ? listen : listen.substring(0, i)).replaceAll("^\\[|\\]$", "");
+    if (h.equals("localhost") || h.equals("::1") || h.startsWith("127.")) return "http://" + listen;
+    die("--issuer (or LMBP_ISSUER) is required when listening on " + listen);
+    return "";
   }
 
   static String env(String k, String d) { String v = System.getenv(k); return v == null || v.isEmpty() ? d : v; }

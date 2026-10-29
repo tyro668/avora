@@ -7,6 +7,7 @@ import time
 import pytest
 
 from lmbp_server import LMBPServer, MemoryStore, SQLiteStore, TenantConfig
+from conftest import issuer
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
@@ -16,7 +17,7 @@ def test_restart_records_orphans_as_outcome_unknown(kind, tmp_path):
         store.create_task({"id": "task_orphan_" + state, "tenant": "acme", "owner": "u1", "device": "d", "model": "m",
                            "state": state, "events": [], "request": {"secret": "prompt"}})
     store.append_event("task_orphan_RUNNING", {"seq": 1, "type": "task.delta", "data": {"text": "partial"}})
-    lmbp = LMBPServer([TenantConfig("acme", "k" * 40)], store=store, log=lambda *a: None, retention=60)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig("acme", "k" * 40)], store=store, log=lambda *a: None, retention=60)
     for state in ("RUNNING", "QUEUED"):
         t = store.get_task("task_orphan_" + state)
         assert t["state"] == "FAILED", f"{state} orphan state {t['state']}"

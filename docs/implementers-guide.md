@@ -11,7 +11,7 @@
 | `spec/asyncapi.yaml` | WebSocket 通道和消息 |
 | `spec/testvectors/vectors.json` | 固定密钥、期望签名和 JWT、正例与反例，以及合法和非法的帧 |
 | `spec/examples/{python,node,rust}` | 关键路径的骨架代码，**都已用测试向量实际运行通过** |
-| `cmd/lmbp-conformance` | 黑盒测试你的网关，共 128 项检查，按 7 个配置统计（规范 §13）；`-list` 输出需求 ID 与检查的对应表 |
+| `cmd/lmbp-conformance` | 黑盒测试你的网关，共 138 项检查，按 7 个配置统计（规范 §13）；`-list` 输出需求 ID 与检查的对应表 |
 | `spec/validate.sh` | 一键校验所有契约，并运行示例骨架 |
 
 ### 代码片段的验证状态
@@ -146,7 +146,7 @@
    6. 客户端断开或超时时发送 `task.cancel`；
    7. 设备断线时任务失败（`DEVICE_OFFLINE`）。
 9. **吊销**：把设备状态改为 `revoked`，并关闭在线会话。
-10. **验证**：先跑测试向量，再执行 `lmbp-conformance -gateway http://localhost:PORT`，直到 128 项全部通过（E6 需加 `-retention`，否则记为跳过）。
+10. **验证**：先跑测试向量，再执行 `lmbp-conformance -gateway http://localhost:PORT`，直到 138 项全部通过（E6 需加 `-retention`，否则记为跳过）。
 
 ---
 

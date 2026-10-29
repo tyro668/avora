@@ -4,6 +4,7 @@ import pytest
 
 from lmbp_server import LMBPServer, MemoryStore, SQLiteStore, TenantConfig
 from simdevice import start_pairing, finish_pairing, connect
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -12,7 +13,7 @@ T = "acme"
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
 async def test_revoke_during_handshake_cannot_resurrect(serve_app, tmp_path, kind):
     st = MemoryStore() if kind == "memory" else SQLiteStore(str(tmp_path / "g.db"))
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
     async with serve_app(lmbp.asgi()) as base:
         key, a = await start_pairing(base, T)
         ok = lmbp.pairing.approve(T, "u1", a["user_code"])
@@ -33,7 +34,7 @@ async def test_e2ee_replay_after_restart_stays_sealed(serve_app, tmp_path):
     from lmbp_server import seal_e2ee_request
     from simdevice import pair_and_connect
     st = SQLiteStore(str(tmp_path / "g.db"))
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
     async with serve_app(lmbp.asgi()) as base:
         ws, task, _ = await pair_and_connect(lmbp, base, T, "u1", e2ee=True)
         dev = lmbp.pairing.list_devices(T, "u1")[0]
@@ -58,7 +59,7 @@ async def test_queued_disconnect_records_cancelled(serve_app):
     import httpx
     from simdevice import pair_and_connect
     st = MemoryStore()
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=st, log=lambda *a: None)
     async with serve_app(lmbp.asgi()) as base:
         ws, dtask, _ = await pair_and_connect(lmbp, base, T, "u1", max_concurrency=1, delay=2.0)
         model = lmbp.pairing.list_devices(T, "u1")[0].device_id + "/m1"

@@ -65,24 +65,14 @@ type DeviceInfo struct {
 	E2EEKey           string            // device-signed X25519 key statement; "" if none
 }
 
-// Link returns the §19.4 deep link. issuer defaults to Options.Issuer.
-func (p *Pairing) Link(tenant, issuer string) (string, error) {
-	if issuer == "" {
-		issuer = p.s.gw.Issuer()
-	}
-	if issuer == "" {
-		return "", errors.New("pairing link needs an issuer (Options.Issuer or argument)")
-	}
-	iss, err := lmbp.Origin(issuer)
-	if err != nil {
-		return "", err
-	}
-	return lmbp.PairLink{Gateway: iss, Tenant: tenant}.String(), nil
+// Link returns the §19.4 deep link for tenant on this gateway (Options.Issuer).
+func (p *Pairing) Link(tenant string) (string, error) {
+	return lmbp.PairLink{Gateway: p.s.gw.Issuer(), Tenant: tenant}.String(), nil
 }
 
 // Create returns the pair link with its QR code (SVG and PNG).
-func (p *Pairing) Create(tenant, issuer string) (PairingInfo, error) {
-	link, err := p.Link(tenant, issuer)
+func (p *Pairing) Create(tenant string) (PairingInfo, error) {
+	link, err := p.Link(tenant)
 	if err != nil {
 		return PairingInfo{}, err
 	}
@@ -108,9 +98,16 @@ func qrSVG(c *qr.Code, cell, margin int) string {
 	return b.String()
 }
 
-// Lookup returns the pending pairing for a user code (to confirm the device name before approving).
-func (p *Pairing) Lookup(ctx context.Context, tenant, userCode string) (PendingPairing, error) {
-	d, err := p.s.gw.PendingPairing(ctx, tenant, userCode)
+// Lookup returns the pending pairing for a user code that endUser typed (to
+// show the device before approving). DeviceName is chosen by the device:
+// render it as untrusted plain text. A code that is not pending counts as a
+// failed attempt of endUser (ErrRateLimited after 10 per minute), exactly
+// like Approve and Deny.
+func (p *Pairing) Lookup(ctx context.Context, tenant, endUser, userCode string) (PendingPairing, error) {
+	d, err := p.s.gw.PendingPairing(ctx, tenant, endUser, userCode)
+	if errors.Is(err, gateway.ErrRateLimited) {
+		return PendingPairing{}, ErrRateLimited
+	}
 	if err != nil {
 		return PendingPairing{}, ErrCodeInvalid
 	}

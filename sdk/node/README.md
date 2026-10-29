@@ -26,7 +26,7 @@ import { LMBPServer, SqliteStore, PairingError } from 'lmbp-server';
 
 const lmbp = new LMBPServer({
   tenants: [{ id: 'acme', apiKey: process.env.TENANT_API_KEY, profile: { display_name: 'Acme CRM' } }],
-  issuer: 'https://saas.example.com',    // 留空为开发模式（取请求 Host）
+  issuer: 'https://saas.example.com',    // 必填：网关公网 origin，绝不从请求 Host 推导
   store: new SqliteStore('lmbp.db'),     // 默认 MemoryStore
 });
 
@@ -64,7 +64,7 @@ server.listen(3000);
 | 构造 | `new LMBPServer({ tenants, issuer, store, signingSeed, maxConcurrency, chatUIDir, log, tuning })` |
 | 挂载 | `handler`、`middleware()`、`fastifyPlugin`、`attach(server)`、`listen(port, host)`、`close()`、`PATHS` |
 | 密钥 | `keys.kid()`、`keys.publicJWK()`、`keys.jwks()`；`LMBPServer.generateSigningSeed()`、`LMBPServer.generateTenantKey()`。未传 `signingSeed` 时种子保存在 Store 中 |
-| 配对 | `pairing.link(tenant, issuer?)`、`pairing.create(...) → { link, qrSVG, qrDataURL }`、`pairing.lookup(tenant, code)`、`pairing.approve(tenant, user, code, { jkt })`、`pairing.deny(...)`、`pairing.listDevices(tenant, user)`、`pairing.revokeDevice(tenant, user, id)`；失败抛 `PairingError`（`code`：`BAD_REQUEST` / `NOT_FOUND` / `FORBIDDEN` / `RATE_LIMITED`；每租户每分钟 10 次错误码后锁定，与 HTTP 批准接口共用计数） |
+| 配对 | `pairing.link(tenant)`、`pairing.create(tenant) → { link, qrSVG, qrDataURL }`、`pairing.lookup(tenant, user, code)`、`pairing.approve(tenant, user, code, { jkt })`、`pairing.deny(...)`、`pairing.listDevices(tenant, user)`、`pairing.revokeDevice(tenant, user, id)`；失败抛 `PairingError`（`code`：`BAD_REQUEST` / `NOT_FOUND` / `FORBIDDEN` / `RATE_LIMITED`；每个最终用户每分钟 10 次错误码后锁定，`lookup` 与 HTTP 批准接口共用计数；`deviceName` 是设备自报名称，只能按纯文本显示并标注来源） |
 | 进程内客户端 | `client(tenant, user)` → `models()`、`chat.completions.create/stream`、`messages.create/stream`（`stream` 返回 `LMBPStream`：async iterable，`lastEventId` 是续传游标，`taskId` 是任务 ID；选项 `signal`、`idempotencyKey`、`lastEventId`；`chat.completions.resume(taskId, lastEventId)` 接着读）；失败抛 `LMBPAPIError{status, code}`；终止符（`[DONE]`/`message_stop`）前流就结束则抛 `IncompleteStreamError{code: 'INCOMPLETE_STREAM', taskId, lastEventId}`，用其游标续传 |
 | E2EE | `sealE2EERequest(device, pinnedJkt, { model, messages })` → `{ jwe, rid, open(frame) }`；请求用 `{ model, lmbp_e2ee: sealed.jwe }`，响应帧 `chunk.lmbp_e2ee` 依次交给 `const rd = sealed.reader()` 的 `rd.next()` 解密（要求 seq 连续递增、`task.done` 之后不再有帧），结束时调用 `rd.finish()`（缺少密封 `task.done` 即视为截断并抛错），再用 `decodeE2EEDelta()` 解析 `task.delta`。`sealed.open()` 只校验单帧，无法发现重排、重复、丢帧或截断。`device` 来自 `listDevices()`（带 `publicKey`、`e2eeKey`） |
 | 存储 | `MemoryStore`、`SqliteStore(path \| db)`（better-sqlite3）；自定义存储实现 `Store` 接口（同步方法） |

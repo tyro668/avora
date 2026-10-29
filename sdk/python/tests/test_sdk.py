@@ -4,13 +4,15 @@ from fastapi import FastAPI
 
 from lmbp_server import LMBPAPIError, LMBPMiddleware, LMBPServer, PairingError, SQLiteStore, TenantConfig, anthropic
 from simdevice import pair_and_connect, start_pairing
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
 
 
 def new(**kw):
-    return LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, **kw)
+    kw.setdefault("issuer", issuer())
+    return LMBPServer(tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, **kw)
 
 
 def test_anthropic_translation():
@@ -37,7 +39,7 @@ async def test_pairing_api(serve_app):
         assert info.link == "lmbp://pair?v=2&gateway=https%3A%2F%2Fgw.example.com&tenant=acme"
         assert info.qr_svg.startswith("<svg")
         _, a = await start_pairing(base, T, "my-laptop")
-        pend = lmbp.pairing.lookup(T, a["user_code"].lower().replace("-", ""))
+        pend = lmbp.pairing.lookup(T, "u1", a["user_code"].lower().replace("-", ""))
         assert pend.device_name == "my-laptop" and pend.status == "pending"
         with pytest.raises(PairingError):
             lmbp.pairing.approve(T, "u1", "BBBB-BBBB")

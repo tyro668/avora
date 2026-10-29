@@ -15,6 +15,7 @@ import pytest
 from lmbp_server import LMBPServer, MemoryStore, SQLiteStore, TenantConfig
 from lmbp_server.engine import RETENTION_DEFAULT, retention_every
 from simdevice import pair_and_connect
+from conftest import issuer
 
 KEY = "k" * 40
 T = "acme"
@@ -24,7 +25,7 @@ HS = {"Authorization": "Bearer " + KEY, "X-End-User": "u1"}
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
 async def test_retention_purges_task_and_idempotency(serve_app, tmp_path, kind):
     store = MemoryStore() if kind == "memory" else SQLiteStore(str(tmp_path / "x.db"))
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None, retention=60)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], store=store, log=lambda *a: None, retention=60)
     runs = []
     async with serve_app(lmbp.asgi()) as base:
         ws, task, dev = await pair_and_connect(lmbp, base, T, "u1", on_run=lambda r: runs.append(r["task_id"]))
@@ -54,10 +55,10 @@ async def test_retention_purges_task_and_idempotency(serve_app, tmp_path, kind):
 async def test_retention_defaults_and_timer(serve_app):
     assert RETENTION_DEFAULT == 7 * 24 * 3600
     assert retention_every(RETENTION_DEFAULT) == 3600 and retention_every(2) == 1
-    off = LMBPServer([TenantConfig(T, KEY)], log=lambda *a: None, retention=-1)
+    off = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY)], log=lambda *a: None, retention=-1)
     off.engine.ensure_retention()
     assert off.engine.retention_task is None, "negative retention still schedules purges"
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, retention=1.5)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None, retention=1.5)
     async with serve_app(lmbp.asgi()) as base:
         ws, task, dev = await pair_and_connect(lmbp, base, T, "u1")
         try:
@@ -73,7 +74,7 @@ async def test_retention_defaults_and_timer(serve_app):
 
 
 async def test_undeclared_model_is_404_offline_is_503(serve_app):
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
     async with serve_app(lmbp.asgi()) as base:
         ws, task, dev = await pair_and_connect(lmbp, base, T, "u1")
         async with httpx.AsyncClient(base_url=base, headers=HS, timeout=10) as h:
@@ -96,7 +97,7 @@ async def test_undeclared_model_is_404_offline_is_503(serve_app):
 
 
 async def test_json_responses_are_no_store(serve_app):
-    lmbp = LMBPServer([TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
+    lmbp = LMBPServer(issuer=issuer(), tenants=[TenantConfig(T, KEY, {"display_name": "Acme"})], log=lambda *a: None)
     async with serve_app(lmbp.asgi()) as base:
         ws, task, dev = await pair_and_connect(lmbp, base, T, "u1")
         try:

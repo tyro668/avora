@@ -14,16 +14,18 @@ import { createRequire } from 'node:module';
 import { LMBPServer, MemoryStore, SqliteStore } from '../dist/index.js';
 import { RETENTION_DEFAULT, retentionEvery } from '../dist/engine/gateway.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const hasSqlite = (() => { try { createRequire(import.meta.url)('better-sqlite3'); return true; } catch { return false; } })();
 
 async function rig(opts = {}) {
   const runs = [];
-  const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {}, ...opts });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {}, ...opts });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   const { ws, deviceId } = await pairAndConnect(lmbp, base, 'acme', 'u1', { onRun: (r) => runs.push(r.task_id) });
   const call = (p, body, hdr = {}) => fetch(base + p, { method: body ? 'POST' : 'GET', body: body && JSON.stringify(body),
@@ -62,7 +64,8 @@ test('retention: defaults to 7 days, negative disables, and the timer purges on 
   assert.equal(RETENTION_DEFAULT, 7 * 24 * 3600_000);
   assert.equal(retentionEvery(RETENTION_DEFAULT), 3600_000);
   assert.equal(retentionEvery(2000), 1000);
-  const off = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY }], log: () => {}, retention: -1 });
+  const lmbpPort = await freePort();
+  const off = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY }], log: () => {}, retention: -1 });
   assert.equal(off.engine.retentionTimer, undefined, 'negative retention still schedules purges');
   await off.close();
   const r = await rig({ retention: 1500 });

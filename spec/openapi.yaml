@@ -99,6 +99,14 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/DeviceAuthorizationResponse' }
         '400': { $ref: '#/components/responses/OAuthError' }
+        '429':
+          description: 'Too many authorizations from this client address, or too many live pending pairings for the tenant (§6.2). Body `{"error":"slow_down"}`.'
+          headers:
+            Retry-After: { schema: { type: integer } }
+            Cache-Control: { schema: { const: no-store } }
+          content:
+            application/json:
+              schema: { type: object, required: [error], properties: { error: { const: slow_down } } }
   /lmbp/v1/token:
     post:
       tags: [device-oauth]
@@ -143,6 +151,7 @@ paths:
     post:
       tags: [tenant-admin]
       summary: Approve or deny a pending user code on behalf of an authenticated end user (RFC 8628 §3.3 back-channel)
+      description: A code is decided once (concurrent approvals yield one device). Failed decisions are counted per end user (tenant + X-End-User); the 11th within a minute gets 429 RATE_LIMITED without looking the code up (§6.4).
       operationId: approveDevice
       security:
         - tenantKey: []
@@ -193,7 +202,7 @@ paths:
         - $ref: '#/components/parameters/EndUser'
       responses:
         '200':
-          description: Devices owned by X-End-User within the tenant.
+          description: Devices owned by X-End-User within the tenant. Pending (unapproved) pairings are never listed (§12.6).
           content:
             application/json:
               schema:
@@ -208,6 +217,7 @@ paths:
     post:
       tags: [tenant-admin]
       summary: Revoke a device; live sessions are closed immediately
+      description: In-flight tasks end like a disconnect (§7.5) — OUTCOME_UNKNOWN (502) once task.run was sent, DEVICE_OFFLINE before — never UNAUTHENTICATED.
       operationId: revokeDevice
       security:
         - tenantKey: []
@@ -417,7 +427,7 @@ components:
             required: [error]
             properties:
               error:
-                enum: [invalid_request, invalid_grant, unsupported_grant_type, authorization_pending, slow_down, access_denied, expired_token, server_error]
+                enum: [invalid_request, invalid_client, invalid_grant, unsupported_grant_type, authorization_pending, slow_down, access_denied, expired_token, server_error]
               error_description: { type: string }
     Problem:
       description: RFC 9457 problem details.
@@ -550,9 +560,13 @@ components:
       type: object
       required: [tenant, public_key]
       properties:
-        tenant: { type: string }
         public_key: { type: string, description: base64url (no padding) of the 32-byte Ed25519 public key }
-        device_name: { type: string, maxLength: 100, description: 'At most 100 Unicode code points (§4.1); longer names are rejected with 400.' }
+        tenant: { type: string, description: 'A tenant registered at this gateway; unknown tenants get 400 invalid_client (§6.2).' }
+        device_name:
+          type: string
+          maxLength: 100
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]*$'
+          description: 'Untrusted, device-chosen label: at most 100 Unicode code points (§4.1), no control, zero-width, line-separator or bidi characters (§6.2); otherwise 400 invalid_request. UIs render it as plain text marked as device-reported.'
     DeviceAuthorizationResponse:
       type: object
       required: [device_code, user_code, expires_in, interval]

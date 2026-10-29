@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect } from '../test-support/simdevice.mjs';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const T = 'acme';
@@ -25,10 +26,11 @@ const errParam = (b) => {
 
 test('shared request-parameter vectors (spec/testvectors/params.json)', async () => {
   assert.ok(V.cases.length >= 80);
-  const lmbp = new LMBPServer({ tenants: [{ id: T, apiKey: KEY }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: T, apiKey: KEY }], log: () => {} });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   const runs = new Map();
   const { ws } = await pairAndConnect(lmbp, base, T, 'u1', { onRun: (r) => runs.set(r.task_id, r) });

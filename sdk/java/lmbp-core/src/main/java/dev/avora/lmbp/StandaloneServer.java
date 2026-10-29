@@ -92,7 +92,7 @@ public final class StandaloneServer implements AutoCloseable {
         headers.merge(h.substring(0, c).trim().toLowerCase(), h.substring(c + 1).trim(), (a, b) -> a + ", " + b);
       }
       if ("websocket".equalsIgnoreCase(headers.getOrDefault("upgrade", ""))) { upgrade(new HttpRequest(rl[0], path, query, headers, new byte[0]), s, in, out); return; }
-      HttpRequest req = new HttpRequest(rl[0], path, query, headers, readBody(in, headers));
+      HttpRequest req = new HttpRequest(rl[0], path, query, headers, readBody(in, headers)).remoteAddress(s.getInetAddress().getHostAddress());
       boolean[] started = {false};
       HttpSink sink = new HttpSink() {
         @Override public void start(int status, Map<String, String> h) throws IOException {

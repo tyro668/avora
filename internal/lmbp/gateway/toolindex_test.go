@@ -14,7 +14,7 @@ import (
 // and Anthropic non-streaming aggregations.
 func TestDeviceToolCallIndexValidated(t *testing.T) {
 	r := newRig(t, lmbp.Flow{TaskWindow: lmbp.DefaultTaskWindow, ConnWindow: lmbp.DefaultConnWindow}, 1, time.Millisecond)
-	for _, idx := range []int{-1, 1 << 30, maxToolCalls} {
+	for _, idx := range []int{-1, 1 << 30, lmbp.MaxToolCallIndex + 1} {
 		for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
 			body := map[string]any{"model": r.model("badidx"), "max_tokens": 10, "messages": []map[string]string{{"role": "user", "content": strconv.Itoa(idx)}}}
 			code, m := r.api(t, "POST", path, body, nil)

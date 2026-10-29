@@ -180,7 +180,6 @@ svg{display:block;flex:none}
 .badge.on::before{content:"";width:6px;height:6px;border-radius:50%;background:#22a06b}
 .badge.off{background:#f2f2f0;color:#6b6b67}
 .badge.rv{background:#fdecea;color:#b4372b}
-.badge.wait{background:#fff4e0;color:#9a5b00}
 .stepc{margin:14px 24px 0;border:1px solid var(--line);border-radius:14px;padding:14px 16px}
 .stepc.active{border-color:#bfe3dc;background:linear-gradient(#f4fbf9,#fff)}
 .stepc b.h{font-weight:600;font-size:14px}
@@ -278,8 +277,8 @@ svg{display:block;flex:none}
       <div class="lk"><span data-icon="link" data-c="#8a8a86" data-s="14"></span><span id="pairLink"></span><button id="copyLink" class="btn sm" type="button"><span data-icon="copy" data-c="#2a2a28" data-s="13"></span>复制</button></div>
       <div class="row cli"><span data-icon="term" data-c="#8a8a86" data-s="13"></span>也可以用命令行连接<button id="copyCmd" type="button">复制 CLI 命令</button></div>
     </div>
-    <div id="step2" class="stepc"><div class="row" style="gap:10px"><span id="sn2" class="sn">2</span><b id="pairReqTitle" class="h">输入配对码</b><span class="sp"></span><span id="pairWait" class="badge wait hidden">待确认</span></div>
-      <div id="pairReqDesc" class="ind" style="font-size:13px;color:#5f5f5b;margin-top:8px">桌面端发起配对后，输入它显示的 8 位配对码</div>
+    <div id="step2" class="stepc"><div class="row" style="gap:10px"><span id="sn2" class="sn">2</span><b id="pairReqTitle" class="h">输入配对码</b></div>
+      <div id="pairReqDesc" class="ind" style="font-size:13px;color:#5f5f5b;margin-top:8px">输入你自己电脑上 Avora 桌面端显示的 8 位配对码；不要输入别人发给你的配对码</div>
       <div id="codeBox" class="code ind"><input id="code" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="配对码"></div>
       <button id="advToggle" class="adv ind" type="button"><span data-icon="chevr" data-c="#8a8a86" data-s="13"></span>高级</button>
       <div id="advBody" class="advb ind hidden"><label for="jkt">设备密钥指纹 jkt（可选，校验配对请求来自这台设备）</label><input id="jkt" class="field" spellcheck="false"></div>

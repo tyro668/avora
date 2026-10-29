@@ -31,6 +31,8 @@ final class Http {
     byte[] body; // null if over MAX_BODY
     Socket sock;
     InputStream in;
+    /** TCP peer address (the per-client key of the authorize rate limit). */
+    String remoteAddr = "";
     final Gateway.Abort abort = new Gateway.Abort();
 
     String header(String k) { String v = headers.get(k); return v == null ? "" : v; }
@@ -165,6 +167,7 @@ final class Http {
       req.method = rl[0];
       req.target = rl[1];
       req.sock = s;
+      req.remoteAddr = s.getInetAddress() == null ? "" : s.getInetAddress().getHostAddress();
       req.in = in;
       int q = req.target.indexOf('?');
       req.path = q < 0 ? req.target : req.target.substring(0, q);

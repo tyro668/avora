@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { LMBPServer } from '../dist/index.js';
 import { pairAndConnect, connect } from '../test-support/simdevice.mjs';
 import * as L from '../dist/engine/lmbp.js';
+import { freePort } from './_port.mjs';
 
 const KEY = 'k'.repeat(40);
 const until = async (cond, ms, what) => {
@@ -20,10 +21,11 @@ const WIN = L.MAX_FRAME_BYTES; // smallest legal windows: one blob chunk at a ti
 const image = () => 'data:image/png;base64,' + crypto.randomBytes(300 * 1024).toString('base64'); // 4 chunks
 
 test('cancel while chunks wait for credit, then resume: no connection credit leaks', async () => {
-  const lmbp = new LMBPServer({ tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
+  const lmbpPort = await freePort();
+  const lmbp = new LMBPServer({ issuer: `http://127.0.0.1:${lmbpPort}`, tenants: [{ id: 'acme', apiKey: KEY, profile: { display_name: 'Acme' } }], log: () => {} });
   const srv = http.createServer(lmbp.handler);
   lmbp.attach(srv);
-  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  await new Promise((ok) => srv.listen(lmbpPort, '127.0.0.1', ok));
   const base = `http://127.0.0.1:${srv.address().port}`;
   let token = '';
   let answer = false; // second connection: ACK and answer

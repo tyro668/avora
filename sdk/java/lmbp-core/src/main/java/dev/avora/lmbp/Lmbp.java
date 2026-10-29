@@ -36,6 +36,30 @@ final class Lmbp {
   /** Unicode code points, the unit of every string limit (spec §4.1). */
   public static int charLen(String s) { return s.codePointCount(0, s.length()); }
 
+  /** Largest task.delta tool_calls[].index (spec §16.1). */
+  public static final int MAX_TOOL_CALL_INDEX = 127;
+  /** Encoded task.delta bytes one task may send, cleartext or sealed (spec §10). */
+  public static final long MAX_TASK_OUTPUT_BYTES = 64L << 20;
+  /** device_name: at most 100 code points (spec §6.2). */
+  public static final int MAX_DEVICE_NAME_CHARS = 100;
+
+  /**
+   * The spec §6.2 rule for the untrusted, device-reported name: at most 100 code points and none of
+   * the characters that can disguise text (C0/C1 controls, U+00AD, U+061C, U+180E, U+200B-U+200F,
+   * U+2028-U+202E, U+2060-U+206F, U+FEFF, U+FFF9-U+FFFB, lone surrogates).
+   */
+  public static boolean validDeviceName(String s) {
+    if (s == null || charLen(s) > MAX_DEVICE_NAME_CHARS) return false;
+    for (int i = 0; i < s.length(); ) {
+      int r = s.codePointAt(i);
+      i += Character.charCount(r);
+      if (r <= 0x1F || (r >= 0x7F && r <= 0x9F) || r == 0xAD || r == 0x61C || r == 0x180E || (r >= 0x200B && r <= 0x200F)
+          || (r >= 0x2028 && r <= 0x202E) || (r >= 0x2060 && r <= 0x206F) || r == 0xFEFF || (r >= 0xFFF9 && r <= 0xFFFB)
+          || (r >= 0xD800 && r <= 0xDFFF)) return false;
+    }
+    return true;
+  }
+
   /** 1..max printable ASCII (0x20-0x7E): X-End-User and Idempotency-Key (spec §4.1). */
   public static boolean validHeader(String s, int max) {
     if (s == null || s.isEmpty() || s.length() > max) return false;
